@@ -11,6 +11,7 @@ import (
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 	"github.com/bwmarrin/snowflake"
 	"github.com/lni/goutils/syncutil"
+	"github.com/panjf2000/ants/v2"
 	"github.com/sasha-s/go-deadlock"
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
@@ -39,6 +40,9 @@ type channelReactor struct {
 	loadChannMu deadlock.RWMutex
 
 	stopped atomic.Bool
+
+	// 处理者用的携程池
+	processGoPool *ants.MultiPool
 }
 
 func newChannelReactor(s *Server, opts *Options) *channelReactor {
@@ -53,8 +57,8 @@ func newChannelReactor(s *Server, opts *Options) *channelReactor {
 		processDeliverC:        make(chan *deliverReq, 2048),
 		processSendackC:        make(chan *sendackReq, 2048),
 		processForwardC:        make(chan *forwardReq, 2048),
-		processCloseC:          make(chan *closeReq, 10),
-		processCheckTagC:       make(chan *checkTagReq, 100),
+		processCloseC:          make(chan *closeReq, 1024),
+		processCheckTagC:       make(chan *checkTagReq, 1024),
 		stopper:                syncutil.NewStopper(),
 		opts:                   opts,
 		Log:                    wklog.NewWKLog(fmt.Sprintf("ChannelReactor[%d]", opts.Cluster.NodeId)),
@@ -66,6 +70,23 @@ func newChannelReactor(s *Server, opts *Options) *channelReactor {
 		r.subs[i] = sub
 	}
 
+	size := 0
+	sizePerPool := 0
+	if r.opts.Reactor.Channel.ProcessPoolSize <= r.opts.Reactor.Channel.SubCount {
+		size = 1
+		sizePerPool = r.opts.Reactor.Channel.ProcessPoolSize
+	} else {
+		size = r.opts.Reactor.Channel.SubCount
+		sizePerPool = r.opts.Reactor.Channel.ProcessPoolSize / r.opts.Reactor.Channel.SubCount
+	}
+	var err error
+	r.processGoPool, err = ants.NewMultiPool(size, sizePerPool, ants.LeastTasks, ants.WithPanicHandler(func(i interface{}) {
+		r.Panic("channel reactor processGoPool panic", zap.Any("panic", i), zap.Stack("stack"))
+	}))
+	if err != nil {
+		r.Panic("NewMultiPool panic", zap.Error(err))
+	}
+
 	return r
 }
 
@@ -74,27 +95,24 @@ func (r *channelReactor) start() error {
 	// 高并发处理，适用于分散的耗时任务
 	for i := 0; i < 100; i++ {
 
-		r.stopper.RunWorker(r.processPayloadDecryptLoop)
-
-		r.stopper.RunWorker(r.processDeliverLoop)
-		r.stopper.RunWorker(r.processSendackLoop)
-
 	}
 
 	// 中并发处理，适合于分散但是不是很耗时的任务
 	for i := 0; i < 10; i++ {
-		r.stopper.RunWorker(r.processInitLoop)
-		r.stopper.RunWorker(r.processCloseLoop)
-
-		r.stopper.RunWorker(r.processCheckTagLoop)
-		r.stopper.RunWorker(r.processForwardLoop)
 
 	}
 
 	// 低并发处理，适合于集中的耗时任务，这样可以合并请求批量处理
 	for i := 0; i < 1; i++ {
+		r.stopper.RunWorker(r.processInitLoop)
+		r.stopper.RunWorker(r.processPayloadDecryptLoop)
+		r.stopper.RunWorker(r.processForwardLoop)
+		r.stopper.RunWorker(r.processSendackLoop)
 		r.stopper.RunWorker(r.processPermissionLoop)
 		r.stopper.RunWorker(r.processStorageLoop)
+		r.stopper.RunWorker(r.processDeliverLoop)
+		r.stopper.RunWorker(r.processCheckTagLoop)
+		r.stopper.RunWorker(r.processCloseLoop)
 	}
 
 	for _, sub := range r.subs {
@@ -132,7 +150,7 @@ func (r *channelReactor) reactorSub(key string) *channelReactorSub {
 	return r.subs[i]
 }
 
-func (r *channelReactor) proposeSend(messageId int64, fromUid string, fromDeviceId string, fromConnId int64, fromNodeId uint64, isEncrypt bool, packet *wkproto.SendPacket) error {
+func (r *channelReactor) proposeSend(messageId int64, fromUid string, fromDeviceId string, fromConnId int64, fromNodeId uint64, isEncrypt bool, packet *wkproto.SendPacket, wait bool) error {
 
 	fakeChannelId := packet.ChannelID
 	channelType := packet.ChannelType
@@ -144,7 +162,7 @@ func (r *channelReactor) proposeSend(messageId int64, fromUid string, fromDevice
 	ch := r.loadOrCreateChannel(fakeChannelId, packet.ChannelType)
 
 	// 处理消息
-	err := ch.proposeSend(messageId, fromUid, fromDeviceId, fromConnId, fromNodeId, isEncrypt, packet)
+	err := ch.proposeSend(messageId, fromUid, fromDeviceId, fromConnId, fromNodeId, isEncrypt, packet, wait)
 	if err != nil {
 		r.Error("proposeSend error", zap.Error(err))
 		return err

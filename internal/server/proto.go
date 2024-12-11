@@ -17,29 +17,6 @@ func (s *Server) onData(conn wknet.Conn) error {
 		return nil
 	}
 
-	// 代理协议解析,获取真实IP
-	parseProxyProtoV := conn.Value(ConnKeyParseProxyProto)
-	if parseProxyProtoV != nil && parseProxyProtoV.(bool) {
-		conn.SetValue(ConnKeyParseProxyProto, false)
-		remoteAddr, size, err := parseProxyProto(buff)
-		if err != nil && err != ErrNoProxyProtocol {
-			s.Warn("Failed to parse proxy proto", zap.Error(err))
-		}
-		if remoteAddr != nil {
-			conn.SetRemoteAddr(remoteAddr)
-			s.Debug("parse proxy proto success", zap.String("remoteAddr", remoteAddr.String()))
-		}
-		if size > 0 {
-			_, _ = conn.Discard(size)
-			buff = buff[size:]
-		}
-	}
-
-	data, _ := gnetUnpacket(buff)
-	if len(data) == 0 {
-		return nil
-	}
-
 	var isAuth bool
 	var connCtx *connContext
 	connCtxObj := conn.Context()
@@ -48,6 +25,29 @@ func (s *Server) onData(conn wknet.Conn) error {
 		isAuth = connCtx.isAuth.Load()
 	} else {
 		isAuth = false
+	}
+
+	if !isAuth {
+		if isProxyProto(buff) { // 是否是代理协议
+			remoteAddr, size, err := parseProxyProto(buff)
+			if err != nil && err != ErrNoProxyProtocol {
+				s.Warn("Failed to parse proxy proto", zap.Error(err))
+			}
+			if remoteAddr != nil {
+				conn.SetRemoteAddr(remoteAddr)
+				s.Debug("parse proxy proto success", zap.String("remoteAddr", remoteAddr.String()))
+			}
+			if size > 0 {
+				_, _ = conn.Discard(size)
+				buff = buff[size:]
+			}
+		}
+	}
+
+	// 解码协议包
+	data, _ := gnetUnpacket(buff)
+	if len(data) == 0 {
+		return nil
 	}
 
 	if !isAuth {
@@ -92,12 +92,13 @@ func (s *Server) onData(conn wknet.Conn) error {
 		}
 		connCtx = newConnContext(connInfo, conn, sub)
 		conn.SetContext(connCtx)
+
+		// 添加用户的连接，如果用户不存在则创建
 		s.userReactor.addConnAndCreateUserHandlerIfNotExist(connCtx)
+
 		connCtx.addConnectPacket(connectPacket)
 
-		//  process conn auth
 		_, _ = conn.Discard(len(data))
-		// s.processAuth(conn, packet.(*wkproto.ConnectPacket))
 	} else {
 		offset := 0
 		for len(data) > offset {
@@ -112,7 +113,9 @@ func (s *Server) onData(conn wknet.Conn) error {
 			}
 			offset += size
 			if frame.GetFrameType() == wkproto.SEND {
-				connCtx.addSendPacket(frame.(*wkproto.SendPacket))
+				sendPacket := frame.(*wkproto.SendPacket)
+
+				connCtx.addSendPacket(sendPacket)
 			} else {
 				connCtx.addOtherPacket(frame)
 			}

@@ -8,7 +8,8 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestAddOrUpdateConversations(t *testing.T) {
+func TestConversation(t *testing.T) {
+
 	d := newTestDB(t)
 	err := d.Open()
 	assert.NoError(t, err)
@@ -21,13 +22,15 @@ func TestAddOrUpdateConversations(t *testing.T) {
 	uid := "test1"
 	createdAt := time.Now()
 	updatedAt := time.Now()
+	channelId := "1234"
+	channelType := uint8(1)
 	conversations := []wkdb.Conversation{
 		{
 			Id:           1,
 			Uid:          uid,
 			UnreadCount:  10,
-			ChannelId:    "1234",
-			ChannelType:  1,
+			ChannelId:    channelId,
+			ChannelType:  channelType,
 			ReadToMsgSeq: 1,
 			CreatedAt:    &createdAt,
 			UpdatedAt:    &updatedAt,
@@ -44,70 +47,55 @@ func TestAddOrUpdateConversations(t *testing.T) {
 		},
 	}
 
-	err = d.AddOrUpdateConversations(uid, conversations)
-	assert.NoError(t, err)
-
-}
-
-func TestGetConversations(t *testing.T) {
-	d := newTestDB(t)
-	err := d.Open()
-	assert.NoError(t, err)
-
-	defer func() {
-		err := d.Close()
+	t.Run("AddOrUpdateConversations", func(t *testing.T) {
+		err = d.AddOrUpdateConversationsWithUser(uid, conversations)
 		assert.NoError(t, err)
-	}()
 
-	uid := "test1"
-	createdAt := time.Now()
-	updatedAt := time.Now()
-	conversations := []wkdb.Conversation{
-		{
-			Id:           1,
-			Uid:          uid,
-			ChannelId:    "1234",
-			ChannelType:  1,
-			UnreadCount:  20,
-			ReadToMsgSeq: 2,
-			CreatedAt:    &createdAt,
-			UpdatedAt:    &updatedAt,
-		},
-		{
-			Id:           2,
-			Uid:          uid,
-			ChannelId:    "5678",
-			ChannelType:  1,
-			UnreadCount:  22,
-			ReadToMsgSeq: 10,
-			CreatedAt:    &createdAt,
-			UpdatedAt:    &updatedAt,
-		},
-	}
+		uids, err := d.GetChannelConversationLocalUsers(channelId, 1)
+		assert.NoError(t, err)
+		assert.Len(t, uids, 1)
+		assert.Equal(t, uid, uids[0])
+	})
 
-	err = d.AddOrUpdateConversations(uid, conversations)
-	assert.NoError(t, err)
+	t.Run("GetConversations", func(t *testing.T) {
+		conversations2, err := d.GetConversations(uid)
+		assert.NoError(t, err)
 
-	conversations2, err := d.GetConversations(uid)
-	assert.NoError(t, err)
+		assert.Len(t, conversations, len(conversations2))
 
-	assert.Equal(t, len(conversations), len(conversations2))
+		assert.Equal(t, conversations[0].Uid, conversations2[0].Uid)
+		assert.Equal(t, conversations[0].ChannelId, conversations2[0].ChannelId)
+		assert.Equal(t, conversations[0].ChannelType, conversations2[0].ChannelType)
+		assert.Equal(t, conversations[0].UnreadCount, conversations2[0].UnreadCount)
+		assert.Equal(t, conversations[0].ReadToMsgSeq, conversations2[0].ReadToMsgSeq)
+		assert.Equal(t, conversations[0].CreatedAt.Unix(), conversations2[0].CreatedAt.Unix())
+		assert.Equal(t, conversations[0].UpdatedAt.Unix(), conversations2[0].UpdatedAt.Unix())
 
-	assert.Equal(t, conversations[0].Uid, conversations2[0].Uid)
-	assert.Equal(t, conversations[0].ChannelId, conversations2[0].ChannelId)
-	assert.Equal(t, conversations[0].ChannelType, conversations2[0].ChannelType)
-	assert.Equal(t, conversations[0].UnreadCount, conversations2[0].UnreadCount)
-	assert.Equal(t, conversations[0].ReadToMsgSeq, conversations2[0].ReadToMsgSeq)
-	assert.Equal(t, conversations[0].CreatedAt.Unix(), conversations2[0].CreatedAt.Unix())
-	assert.Equal(t, conversations[0].UpdatedAt.Unix(), conversations2[0].UpdatedAt.Unix())
+		assert.Equal(t, conversations[1].Uid, conversations2[1].Uid)
+		assert.Equal(t, conversations[1].ChannelId, conversations2[1].ChannelId)
+		assert.Equal(t, conversations[1].ChannelType, conversations2[1].ChannelType)
+		assert.Equal(t, conversations[1].UnreadCount, conversations2[1].UnreadCount)
+		assert.Equal(t, conversations[1].ReadToMsgSeq, conversations2[1].ReadToMsgSeq)
+		assert.Equal(t, conversations[1].CreatedAt.Unix(), conversations2[1].CreatedAt.Unix())
+		assert.Equal(t, conversations[1].UpdatedAt.Unix(), conversations2[1].UpdatedAt.Unix())
+	})
 
-	assert.Equal(t, conversations[1].Uid, conversations2[1].Uid)
-	assert.Equal(t, conversations[1].ChannelId, conversations2[1].ChannelId)
-	assert.Equal(t, conversations[1].ChannelType, conversations2[1].ChannelType)
-	assert.Equal(t, conversations[1].UnreadCount, conversations2[1].UnreadCount)
-	assert.Equal(t, conversations[1].ReadToMsgSeq, conversations2[1].ReadToMsgSeq)
-	assert.Equal(t, conversations[1].CreatedAt.Unix(), conversations2[1].CreatedAt.Unix())
-	assert.Equal(t, conversations[1].UpdatedAt.Unix(), conversations2[1].UpdatedAt.Unix())
+	t.Run("DeleteConversation", func(t *testing.T) {
+		err = d.DeleteConversation(uid, channelId, channelType)
+		assert.NoError(t, err)
+
+		conversations2, err := d.GetConversations(uid)
+		assert.NoError(t, err)
+
+		assert.Len(t, conversations2, 1)
+		conversations[1].UpdatedAt = nil
+		conversations2[0].UpdatedAt = nil
+		assert.Equal(t, conversations[1].Uid, conversations2[0].Uid)
+		assert.Equal(t, conversations[1].ChannelId, conversations2[0].ChannelId)
+		assert.Equal(t, conversations[1].ChannelType, conversations2[0].ChannelType)
+		assert.Equal(t, conversations[1].UnreadCount, conversations2[0].UnreadCount)
+		assert.Equal(t, conversations[1].ReadToMsgSeq, conversations2[0].ReadToMsgSeq)
+	})
 
 }
 
@@ -141,7 +129,7 @@ func TestDeleteConversation(t *testing.T) {
 		},
 	}
 
-	err = d.AddOrUpdateConversations(uid, conversations)
+	err = d.AddOrUpdateConversationsWithUser(uid, conversations)
 	assert.NoError(t, err)
 
 	err = d.DeleteConversation(uid, "1234", 1)
@@ -195,3 +183,48 @@ func TestDeleteConversation(t *testing.T) {
 // 	assert.Equal(t, conversations[0], conversations2[0])
 // 	assert.Equal(t, conversations[1], conversations2[1])
 // }
+
+// 测试 AddOrUpdateConversations 的性能
+
+func BenchmarkAddOrUpdateConversations(b *testing.B) {
+	d := newTestDB(b)
+	err := d.Open()
+	assert.NoError(b, err)
+
+	defer func() {
+		err := d.Close()
+		assert.NoError(b, err)
+	}()
+
+	uid := "test1"
+	createdAt := time.Now()
+	updatedAt := time.Now()
+	conversations := []wkdb.Conversation{
+		{
+			Id:           1,
+			Uid:          uid,
+			ChannelId:    "1234",
+			ChannelType:  1,
+			UnreadCount:  20,
+			ReadToMsgSeq: 2,
+			CreatedAt:    &createdAt,
+			UpdatedAt:    &updatedAt,
+		},
+		{
+			Id:           2,
+			Uid:          uid,
+			ChannelId:    "5678",
+			ChannelType:  1,
+			UnreadCount:  22,
+			ReadToMsgSeq: 10,
+			CreatedAt:    &createdAt,
+			UpdatedAt:    &updatedAt,
+		},
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		err = d.AddOrUpdateConversationsWithUser(uid, conversations)
+		assert.NoError(b, err)
+	}
+}

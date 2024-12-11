@@ -184,7 +184,11 @@ func (s *slot) AppliedIndex() (uint64, error) {
 }
 
 func (s *slot) SetHardState(hd replica.HardState) {
+	if s.leaderId.Load() != 0 && hd.LeaderId != s.leaderId.Load() {
+		s.Info("slot leader change", zap.Uint64("oldLeader", s.leaderId.Load()), zap.Uint64("newLeader", hd.LeaderId))
+	}
 	s.leaderId.Store(hd.LeaderId)
+
 }
 
 func (s *slot) Tick() {
@@ -194,15 +198,6 @@ func (s *slot) Tick() {
 func (s *slot) Step(m replica.Message) error {
 
 	return s.rc.Step(m)
-}
-
-func (s *slot) SetAppliedIndex(index uint64) error {
-	shardNo := s.key
-	err := s.opts.SlotLogStorage.SetAppliedIndex(shardNo, index)
-	if err != nil {
-		s.Error("set applied index error", zap.Error(err))
-	}
-	return nil
 }
 
 func (s *slot) IsPrepared() bool {
@@ -321,11 +316,6 @@ func (s *slot) SpeedLevel() replica.SpeedLevel {
 	return s.rc.SpeedLevel()
 }
 
-func (s *slot) AppendLogs(logs []replica.Log) error {
-
-	return s.s.slotStorage.AppendLogs(s.key, logs)
-}
-
 func (s *slot) SetLeaderTermStartIndex(term uint32, index uint64) error {
 
 	return s.opts.SlotLogStorage.SetLeaderTermStartIndex(s.key, term, index)
@@ -355,4 +345,8 @@ func (s *slot) DeleteLeaderTermStartIndexGreaterThanTerm(term uint32) error {
 
 func (s *slot) TruncateLogTo(index uint64) error {
 	return s.opts.SlotLogStorage.TruncateLogTo(s.key, index)
+}
+
+func (s *slot) DetailLogOn(on bool) {
+	s.rc.DetailLogOn(on)
 }

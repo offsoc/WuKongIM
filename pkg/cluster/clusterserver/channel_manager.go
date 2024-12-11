@@ -5,10 +5,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/reactor"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/replica"
-	"github.com/WuKongIM/WuKongIM/pkg/trace"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
 	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
@@ -22,6 +22,8 @@ type channelManager struct {
 	opts           *Options
 	s              *Server
 	wklog.Log
+
+	sync.RWMutex
 }
 
 func newChannelManager(s *Server) *channelManager {
@@ -37,11 +39,6 @@ func newChannelManager(s *Server) *channelManager {
 		reactor.WithAutoSlowDownOn(true),
 		reactor.WithRequest(cm),
 		reactor.WithSubReactorNum(s.opts.ChannelReactorSubCount),
-		reactor.WithOnHandlerRemove(func(h reactor.IHandler) {
-			if h.LeaderId() == cm.opts.NodeId {
-				trace.GlobalTrace.Metrics.Cluster().ChannelActiveCountAdd(-1)
-			}
-		}),
 	))
 	return cm
 }
@@ -55,27 +52,71 @@ func (c *channelManager) stop() {
 }
 
 func (c *channelManager) add(ch *channel) {
+	c.Lock()
+	defer c.Unlock()
 	c.channelReactor.AddHandler(ch.key, ch)
 }
 
 func (c *channelManager) remove(ch *channel) {
+	c.Lock()
+	defer c.Unlock()
 	c.channelReactor.RemoveHandler(ch.key)
 }
 
 func (c *channelManager) get(channelId string, channelType uint8) reactor.IHandler {
+	c.RLock()
+	defer c.RUnlock()
 	return c.channelReactor.Handler(wkutil.ChannelToKey(channelId, channelType))
 }
 
+func (c *channelManager) getOrCreateIfNotExist(channelId string, channelType uint8) reactor.IHandler {
+	c.Lock()
+	defer c.Unlock()
+
+	handleKey := wkutil.ChannelToKey(channelId, channelType)
+
+	handler := c.channelReactor.Handler(handleKey)
+	if handler != nil {
+		return handler
+	}
+	handler = newChannel(channelId, channelType, c.s)
+	c.channelReactor.AddHandler(handleKey, handler)
+	return handler
+
+}
+
+func (c *channelManager) getOrCreateIfNotExistWithHandleKey(handleKey string) reactor.IHandler {
+	c.Lock()
+	defer c.Unlock()
+
+	channelId, channelType := wkutil.ChannelFromlKey(handleKey)
+
+	handler := c.channelReactor.Handler(handleKey)
+	if handler != nil {
+		return handler
+	}
+	handler = newChannel(channelId, channelType, c.s)
+	c.channelReactor.AddHandler(handleKey, handler)
+	return handler
+
+}
+
 func (c *channelManager) exist(channelId string, channelType uint8) bool {
+	c.RLock()
+	defer c.RUnlock()
 	return c.channelReactor.ExistHandler(wkutil.ChannelToKey(channelId, channelType))
 }
 
 // 频道数量
 func (c *channelManager) channelCount() int {
+	c.RLock()
+	defer c.RUnlock()
 	return c.channelReactor.HandlerLen()
 }
 
 func (c *channelManager) getWithHandleKey(handleKey string) reactor.IHandler {
+	c.RLock()
+	defer c.RUnlock()
 	return c.channelReactor.Handler(handleKey)
 }
 
@@ -143,7 +184,7 @@ func (c *channelManager) GetLeaderTermStartIndex(req reactor.LeaderTermStartInde
 	if err != nil {
 		return 0, err
 	}
-	if resp.Status != proto.Status_OK {
+	if resp.Status != proto.StatusOK {
 		return 0, fmt.Errorf("get leader term start index failed, status: %v", resp.Status)
 	}
 	if len(resp.Body) > 0 {
@@ -152,7 +193,7 @@ func (c *channelManager) GetLeaderTermStartIndex(req reactor.LeaderTermStartInde
 	return 0, nil
 }
 
-func (c *channelManager) AppendLogs(handlerKey string, logs []replica.Log) error {
+func (c *channelManager) Append(req reactor.AppendLogReq) error {
 
 	// for _, req := range reqs {
 	// 	if req.Logs == nil || len(req.Logs) == 0 {
@@ -163,7 +204,7 @@ func (c *channelManager) AppendLogs(handlerKey string, logs []replica.Log) error
 	// 	}
 
 	// }
-	return c.opts.MessageLogStorage.AppendLogs(handlerKey, logs)
+	return c.opts.MessageLogStorage.Append(req)
 }
 
 func (c *channelManager) request(toNodeId uint64, path string, body []byte) (*proto.Response, error) {

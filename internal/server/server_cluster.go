@@ -17,9 +17,9 @@ func (s *Server) handleClusterMessage(fromNodeId uint64, msg *proto.Message) {
 
 	switch ClusterMsgType(msg.MsgType) {
 	case ClusterMsgTypeNodePing: // 节点ping
-		s.handleNodePing(fromNodeId, msg)
+		go s.handleNodePing(fromNodeId, msg)
 	case ClusterMsgTypeNodePong: // 节点Pong
-		s.handleNodePong(fromNodeId, msg)
+		go s.handleNodePong(fromNodeId, msg)
 
 	}
 	// switch ClusterMsgType(msg.MsgType) {
@@ -38,6 +38,8 @@ func (s *Server) setClusterRoutes() {
 	// s.cluster.Route("/wk/connPing", s.handleOnConnPingReq)
 	// 转发消息到频道的领导节点
 	s.cluster.Route("/wk/channelFoward", s.handleChannelForward)
+	// 批量转发
+	// s.cluster.Route("/wk/channelFowards", s.handleChannelForward)
 	// 转发sendack回执信息到源节点
 	s.cluster.Route("/wk/forwardSendack", s.handleForwardSendack)
 	// 转发连接写数据
@@ -55,6 +57,11 @@ func (s *Server) setClusterRoutes() {
 	s.cluster.Route("/wk/getNodeUidsByTag", s.getNodeUidsByTag)
 	// 是否允许发送消息
 	s.cluster.Route("/wk/allowSend", s.handleAllowSend)
+	// 获取订阅者
+	s.cluster.Route("/wk/getSubscribers", s.handleGetSubscribers)
+
+	// 频道重新创建ReceiverTag
+	s.cluster.Route("/wk/makeReceiverTag", s.handleMakeReceiverTag)
 
 }
 
@@ -90,7 +97,7 @@ func (s *Server) handleChannelForward(c *wkserver.Context) {
 		sendPacket := reactorChannelMessage.SendPacket
 		// 提案频道消息
 		ch := s.channelReactor.loadOrCreateChannel(req.ChannelId, req.ChannelType)
-		err = ch.proposeSend(reactorChannelMessage.MessageId, reactorChannelMessage.FromUid, reactorChannelMessage.FromDeviceId, reactorChannelMessage.FromConnId, reactorChannelMessage.FromNodeId, false, sendPacket)
+		err = ch.proposeSend(reactorChannelMessage.MessageId, reactorChannelMessage.FromUid, reactorChannelMessage.FromDeviceId, reactorChannelMessage.FromConnId, reactorChannelMessage.FromNodeId, false, sendPacket, false)
 		if err != nil {
 			s.Error("handleChannelForward: proposeSend failed")
 			c.WriteErr(err)
@@ -117,6 +124,10 @@ func (s *Server) handleForwardSendack(c *wkserver.Context) {
 	}
 
 	for _, forwardSendackPacket := range forwardSendackPacketSet {
+		if forwardSendackPacket.DeviceId == s.opts.SystemDeviceId {
+			continue
+		}
+
 		conn := s.userReactor.getConnById(forwardSendackPacket.Uid, forwardSendackPacket.ConnId)
 		if conn == nil {
 			s.Error("handleForwardSendack: conn not found", zap.String("uid", forwardSendackPacket.Uid), zap.String("deviceId", forwardSendackPacket.DeviceId))
@@ -150,16 +161,19 @@ func (s *Server) handleConnWrite(c *wkserver.Context) {
 
 	conn := s.userReactor.getConnById(fowardWriteReq.Uid, fowardWriteReq.ConnId)
 	if conn == nil {
-		s.Error("handleConnWrite: conn not found", zap.String("uid", fowardWriteReq.Uid), zap.Int64("connId", fowardWriteReq.ConnId))
+		s.Debug("handleConnWrite: conn not found", zap.String("uid", fowardWriteReq.Uid), zap.Int64("connId", fowardWriteReq.ConnId))
 		c.WriteErrorAndStatus(ErrConnNotFound, proto.Status(errCodeConnNotFound))
 		return
 	}
 	if conn.conn == nil {
-		s.Error("handleConnWrite: conn is nil", zap.String("uid", fowardWriteReq.Uid), zap.Int64("connId", fowardWriteReq.ConnId))
+		s.Debug("handleConnWrite: conn is nil", zap.String("uid", fowardWriteReq.Uid), zap.Int64("connId", fowardWriteReq.ConnId))
 		c.WriteErrorAndStatus(ErrConnNotFound, proto.Status(errCodeConnNotFound))
 		return
 	}
-	_ = conn.writeDirectly(fowardWriteReq.Data, fowardWriteReq.RecvFrameCount)
+	err = conn.writeDirectly(fowardWriteReq.Data, fowardWriteReq.RecvFrameCount)
+	if err != nil {
+		s.Warn("handleConnWrite: writeDirectly failed", zap.Error(err), zap.String("uid", fowardWriteReq.Uid), zap.Int64("connId", fowardWriteReq.ConnId))
+	}
 	c.WriteOk()
 }
 
@@ -216,11 +230,7 @@ func (s *Server) handleUserAction(c *wkserver.Context) {
 	sub := s.userReactor.reactorSub(uid)
 	for _, action := range actions {
 		action.UniqueNo = ""
-		userHandler := s.userReactor.getUserHandler(action.Uid)
-		if userHandler == nil {
-			uh := newUserHandler(uid, sub)
-			sub.addUserHandlerIfNotExist(uh)
-		}
+		sub.addOrCreateUserHandlerIfNotExist(uid)
 		sub.step(action.Uid, action)
 	}
 	c.WriteOk()
@@ -239,23 +249,29 @@ func (s *Server) handleUserAuthResult(c *wkserver.Context) {
 	connCtx := s.userReactor.getConnById(authResult.Uid, authResult.ConnId)
 	if connCtx == nil {
 		s.Error("auth: handleUserAuthResult: conn not found", zap.String("uid", authResult.Uid), zap.Int64("connId", authResult.ConnId))
-		c.WriteErrorAndStatus(errors.New("handleUserAuthResult: conn not found"), proto.Status_NotFound)
+		c.WriteErrorAndStatus(errors.New("handleUserAuthResult: conn not found"), proto.StatusNotFound)
 		return
 	}
 	if connCtx.deviceId != authResult.DeviceId {
 		s.Error("auth: handleUserAuthResult: deviceId not match", zap.String("expect", connCtx.deviceId), zap.String("act", authResult.DeviceId))
-		c.WriteErrorAndStatus(errors.New("handleUserAuthResult: deviceId not match"), proto.Status_NotFound)
+		c.WriteErrorAndStatus(errors.New("handleUserAuthResult: deviceId not match"), proto.StatusNotFound)
 		return
 	}
 	if !connCtx.isRealConn {
 		s.Error("auth: handleUserAuthResult: not real conn", zap.String("uid", authResult.Uid), zap.Int64("connId", authResult.ConnId))
-		c.WriteErrorAndStatus(errors.New("handleUserAuthResult: not real conn"), proto.Status_NotFound)
+		c.WriteErrorAndStatus(errors.New("handleUserAuthResult: not real conn"), proto.StatusNotFound)
 		return
 	}
 
 	if authResult.ReasonCode == wkproto.ReasonSuccess {
-		connCtx.aesIV = authResult.AesIV
-		connCtx.aesKey = authResult.AesKey
+		if authResult.AesKey == "" || authResult.AesIV == "" {
+			s.Error("auth: handleUserAuthResult: aesKey or aesIV is empty", zap.String("uid", authResult.Uid), zap.Int64("connId", authResult.ConnId))
+			c.WriteErrorAndStatus(errors.New("handleUserAuthResult: aesKey or aesIV is empty"), proto.StatusNotFound)
+			return
+		}
+
+		connCtx.aesIV = []byte(authResult.AesIV)
+		connCtx.aesKey = []byte(authResult.AesKey)
 		connCtx.deviceLevel = authResult.DeviceLevel
 		connCtx.deviceId = authResult.DeviceId
 		connCtx.protoVersion = authResult.ProtoVersion
@@ -378,6 +394,11 @@ func (s *Server) handleNodePing(fromNodeId uint64, msg *proto.Message) {
 		return
 	}
 
+	// fmt.Println("handleNodePing---->", req.leaderId)
+	// for _, ping := range req.pings {
+	// 	fmt.Println("ping------->", ping.uid, ping.connIds)
+	// }
+
 	// 踢掉不存在的连接
 	for _, ping := range req.pings {
 
@@ -485,4 +506,51 @@ func (s *Server) handleAllowSend(c *wkserver.Context) {
 		return
 	}
 	c.WriteErrorAndStatus(errors.New("not allow send"), proto.Status(reasonCode))
+}
+
+func (s *Server) handleGetSubscribers(c *wkserver.Context) {
+	req := &subscriberGetReq{}
+	err := req.Unmarshal(c.Body())
+	if err != nil {
+		s.Error("handleGetSubscribers Unmarshal err", zap.Error(err))
+		c.WriteErr(err)
+		return
+	}
+
+	members, err := s.store.GetSubscribers(req.ChannelId, req.ChannelType)
+	if err != nil {
+		s.Error("handleGetSubscribers: GetSubscribers failed", zap.Error(err))
+		c.WriteErr(err)
+		return
+	}
+
+	resps := subscriberGetResp{}
+
+	for _, member := range members {
+		resps = append(resps, member.Uid)
+	}
+	c.Write(resps.Marshal())
+}
+
+func (s *Server) handleMakeReceiverTag(c *wkserver.Context) {
+	req := &channelReq{}
+	err := req.Unmarshal(c.Body())
+	if err != nil {
+		s.Error("handleMakeReceiverTag Unmarshal err", zap.Error(err))
+		c.WriteErr(err)
+		return
+	}
+
+	channelKey := wkutil.ChannelToKey(req.ChannelId, req.ChannelType)
+
+	channel := s.channelReactor.reactorSub(channelKey).channel(channelKey)
+	if channel != nil {
+		_, err = channel.makeReceiverTag()
+		if err != nil {
+			s.Error("handleMakeReceiverTag: 创建接收者标签失败！", zap.Error(err))
+			c.WriteErr(err)
+			return
+		}
+	}
+	c.WriteOk()
 }

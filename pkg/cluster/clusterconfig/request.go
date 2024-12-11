@@ -67,7 +67,7 @@ func (r *Request) GetLeaderTermStartIndex(req reactor.LeaderTermStartIndexReq) (
 	if err != nil {
 		return 0, err
 	}
-	if resp.Status != proto.Status_OK {
+	if resp.Status != proto.StatusOK {
 		return 0, fmt.Errorf("get leader term start index failed, status: %v", resp.Status)
 	}
 	if len(resp.Body) > 0 {
@@ -76,8 +76,8 @@ func (r *Request) GetLeaderTermStartIndex(req reactor.LeaderTermStartIndexReq) (
 	return 0, nil
 }
 
-func (r *Request) AppendLogs(handlerKey string, logs []replica.Log) error {
-	if err := r.s.storage.AppendLog(logs); err != nil {
+func (r *Request) Append(req reactor.AppendLogReq) error {
+	if err := r.s.storage.AppendLog(req.Logs); err != nil {
 		return err
 	}
 	return nil

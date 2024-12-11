@@ -79,11 +79,8 @@ func (s *Server) channelMigrate(c *wkhttp.Context) {
 		newClusterConfig.Learners = append(newClusterConfig.Learners, req.MigrateTo)
 	}
 
-	timeoutCtx, cancel := context.WithTimeout(s.cancelCtx, s.opts.ReqTimeout)
-	defer cancel()
-
 	// 提案保存配置
-	err = s.opts.ChannelClusterStorage.Propose(timeoutCtx, newClusterConfig)
+	err = s.opts.ChannelClusterStorage.Propose(newClusterConfig)
 	if err != nil {
 		s.Error("channelMigrate: Save error", zap.Error(err))
 		c.ResponseError(err)
@@ -448,12 +445,23 @@ func (s *Server) channelLocalReplica(c *wkhttp.Context) {
 		c.ResponseError(err)
 		return
 	}
+	var term uint32
+	if lastMsgSeq > 0 {
+		msg, err := s.opts.DB.LoadMsg(channelId, channelType, lastMsgSeq)
+		if err != nil {
+			s.Error("LoadMsg error", zap.Error(err))
+			c.ResponseError(err)
+			return
+		}
+		term = uint32(msg.Term)
+	}
 
 	resp := &channelReplicaResp{
 		ReplicaId:   s.opts.NodeId,
 		Running:     wkutil.BoolToInt(running),
 		LastMsgSeq:  lastMsgSeq,
 		LastMsgTime: lastTime,
+		Term:        term,
 	}
 
 	c.JSON(http.StatusOK, resp)

@@ -25,7 +25,6 @@ type ReactorChannelMessage struct {
 	MessageSeq   uint32
 	SendPacket   *wkproto.SendPacket
 	IsEncrypt    bool // SendPacket的payload是否加密
-	IsSystem     bool // 是否是系统发送的消息
 	ReasonCode   wkproto.ReasonCode
 	Index        uint64
 }
@@ -39,7 +38,6 @@ func (r *ReactorChannelMessage) Marshal() ([]byte, error) {
 	enc.WriteUint64(r.FromNodeId)
 	enc.WriteInt64(r.MessageId)
 	enc.WriteUint8(wkutil.BoolToUint8(r.IsEncrypt))
-	enc.WriteUint8(wkutil.BoolToUint8(r.IsSystem))
 	enc.WriteUint8(uint8(r.ReasonCode))
 
 	var packetData []byte
@@ -83,12 +81,6 @@ func (r *ReactorChannelMessage) Unmarshal(data []byte) error {
 	}
 	r.IsEncrypt = wkutil.Uint8ToBool(isEncrypt)
 
-	var isSystem uint8
-	if isSystem, err = dec.Uint8(); err != nil {
-		return err
-	}
-	r.IsSystem = wkutil.Uint8ToBool(isSystem)
-
 	var reasonCode uint8
 	if reasonCode, err = dec.Uint8(); err != nil {
 		return err
@@ -113,18 +105,16 @@ func (r *ReactorChannelMessage) Unmarshal(data []byte) error {
 
 func (m *ReactorChannelMessage) Size() uint64 {
 	size := uint64(0)
-
-	size += 1
 	size += 8 // FromConnId
-	size += uint64(len(m.FromUid)) + 2
-	size += uint64(len(m.FromDeviceId)) + 2
+	size += (uint64(len(m.FromUid)) + 2)
+	size += (uint64(len(m.FromDeviceId)) + 2)
 	size += 8 // FromNodeId
-	size += 8 // messageId
-	size += 4 // messageSeq
+	size += 8 // MessageId
+	size += 1 // IsEncrypt
+	size += 1 // IsSystem
+	size += 1 // ReasonCode
 	if m.SendPacket != nil {
-		size += uint64(m.SendPacket.RemainingLength) + 2
-	} else {
-		size += 2
+		size += (1 + uint64(m.SendPacket.GetRemainingLength()) + 2)
 	}
 	return size
 }
@@ -282,6 +272,7 @@ func (m *ReactorUserMessage) Size() uint64 {
 	} else {
 		size += (1 + uint64(len(m.OutBytes))) + 2
 	}
+	size += 8 // index
 
 	return size
 }
@@ -526,6 +517,61 @@ func (s *everyScheduler) Next(prev time.Time) time.Time {
 	return prev.Add(s.Interval)
 }
 
+type FowardWriteReqSlice []*FowardWriteReq
+
+func (f FowardWriteReqSlice) Marshal() ([]byte, error) {
+	enc := wkproto.NewEncoder()
+	defer enc.End()
+	enc.WriteUint32(uint32(len(f)))
+	for _, r := range f {
+		enc.WriteString(r.Uid)
+		enc.WriteString(r.DeviceId)
+		enc.WriteInt64(r.ConnId)
+		enc.WriteUint32(r.RecvFrameCount)
+		enc.WriteInt32(int32(len(r.Data)))
+		enc.WriteBytes(r.Data)
+	}
+	return enc.Bytes(), nil
+}
+
+func (f *FowardWriteReqSlice) Unmarshal(data []byte) error {
+	dec := wkproto.NewDecoder(data)
+	count, err := dec.Uint32()
+	if err != nil {
+		return err
+	}
+	if count == 0 {
+		return nil
+	}
+
+	for i := 0; i < int(count); i++ {
+		r := &FowardWriteReq{}
+		if r.Uid, err = dec.String(); err != nil {
+			return err
+		}
+		if r.DeviceId, err = dec.String(); err != nil {
+			return err
+		}
+		if r.ConnId, err = dec.Int64(); err != nil {
+			return err
+		}
+		if r.RecvFrameCount, err = dec.Uint32(); err != nil {
+			return err
+		}
+		dataLen, err := dec.Int32()
+		if err != nil {
+			return err
+		}
+		r.Data, err = dec.Bytes(int(dataLen))
+		if err != nil {
+			return err
+		}
+
+		*f = append(*f, r)
+	}
+	return nil
+}
+
 // 转发写请求
 type FowardWriteReq struct {
 	Uid            string
@@ -533,6 +579,9 @@ type FowardWriteReq struct {
 	ConnId         int64
 	RecvFrameCount uint32 // recv消息数量 (统计用)
 	Data           []byte
+
+	// 以下字段内部使用不编码
+	localConnId int64 // 本地连接ID
 }
 
 func (f *FowardWriteReq) Marshal() ([]byte, error) {
@@ -603,6 +652,32 @@ func (req deleteChannelReq) Check() error {
 	return nil
 }
 
+type channelReq struct {
+	ChannelId   string `json:"channel_id"`
+	ChannelType uint8  `json:"channel_type"`
+}
+
+func (c *channelReq) Marshal() []byte {
+	enc := wkproto.NewEncoder()
+	defer enc.End()
+
+	enc.WriteString(c.ChannelId)
+	enc.WriteUint8(c.ChannelType)
+	return enc.Bytes()
+}
+
+func (c *channelReq) Unmarshal(data []byte) error {
+	dec := wkproto.NewDecoder(data)
+	var err error
+	if c.ChannelId, err = dec.String(); err != nil {
+		return err
+	}
+	if c.ChannelType, err = dec.Uint8(); err != nil {
+		return err
+	}
+	return nil
+}
+
 type syncUserConversationResp struct {
 	ChannelId       string         `json:"channel_id"`         // 频道ID
 	ChannelType     uint8          `json:"channel_type"`       // 频道类型
@@ -657,6 +732,7 @@ func (m MessageRespSlice) Less(i, j int) bool { return m[i].MessageSeq < m[j].Me
 // ChannelCreateReq 频道创建请求
 type ChannelCreateReq struct {
 	ChannelInfoReq
+	Reset       int      `json:"reset"`       // 是否重置订阅者 （0.不重置 1.重置），选择重置，将删除原来的所有成员
 	Subscribers []string `json:"subscribers"` // 订阅者
 }
 
@@ -695,18 +771,78 @@ func (s subscriberAddReq) Check() error {
 	return nil
 }
 
+type subscriberGetReq struct {
+	ChannelId   string `json:"channel_id"`
+	ChannelType uint8  `json:"channel_type"`
+}
+
+func (s *subscriberGetReq) Marshal() []byte {
+	enc := wkproto.NewEncoder()
+	defer enc.End()
+
+	enc.WriteString(s.ChannelId)
+	enc.WriteUint8(s.ChannelType)
+
+	return enc.Bytes()
+}
+
+func (s *subscriberGetReq) Unmarshal(data []byte) error {
+	dec := wkproto.NewDecoder(data)
+	var err error
+	if s.ChannelId, err = dec.String(); err != nil {
+		return err
+	}
+	if s.ChannelType, err = dec.Uint8(); err != nil {
+		return err
+	}
+	return nil
+}
+
+type subscriberGetResp []string
+
+func (s subscriberGetResp) Marshal() []byte {
+	enc := wkproto.NewEncoder()
+	defer enc.End()
+
+	enc.WriteUint32(uint32(len(s)))
+	for _, uid := range s {
+		enc.WriteString(uid)
+	}
+
+	return enc.Bytes()
+}
+
+func (s *subscriberGetResp) Unmarshal(data []byte) error {
+	dec := wkproto.NewDecoder(data)
+	count, err := dec.Uint32()
+	if err != nil {
+		return err
+	}
+	if count == 0 {
+		return nil
+	}
+	for i := 0; i < int(count); i++ {
+		uid, err := dec.String()
+		if err != nil {
+			return err
+		}
+		*s = append(*s, uid)
+	}
+	return nil
+}
+
 type subscriberRemoveReq struct {
-	ChannelID      string   `json:"channel_id"`
+	ChannelId      string   `json:"channel_id"`
 	ChannelType    uint8    `json:"channel_type"`
 	TempSubscriber int      `json:"temp_subscriber"` //  是否是临时订阅者 (1. 是 0. 否)
 	Subscribers    []string `json:"subscribers"`
 }
 
 func (s subscriberRemoveReq) Check() error {
-	if strings.TrimSpace(s.ChannelID) == "" {
+	if strings.TrimSpace(s.ChannelId) == "" {
 		return errors.New("频道ID不能为空！")
 	}
-	if IsSpecialChar(s.ChannelID) {
+	if IsSpecialChar(s.ChannelId) {
 		return errors.New("频道ID不能包含特殊字符！")
 	}
 	if stringArrayIsEmpty(s.Subscribers) {
@@ -729,13 +865,13 @@ func stringArrayIsEmpty(array []string) bool {
 }
 
 type blacklistReq struct {
-	ChannelID   string   `json:"channel_id"`   // 频道ID
+	ChannelId   string   `json:"channel_id"`   // 频道ID
 	ChannelType uint8    `json:"channel_type"` // 频道类型
 	UIDs        []string `json:"uids"`         // 订阅者
 }
 
 func (r blacklistReq) Check() error {
-	if r.ChannelID == "" {
+	if r.ChannelId == "" {
 		return errors.New("channel_id不能为空！")
 	}
 	if r.ChannelType == 0 {
@@ -749,21 +885,21 @@ func (r blacklistReq) Check() error {
 
 // ChannelDeleteReq 删除频道请求
 type ChannelDeleteReq struct {
-	ChannelID   string `json:"channel_id"`   // 频道ID
+	ChannelId   string `json:"channel_id"`   // 频道ID
 	ChannelType uint8  `json:"channel_type"` // 频道类型
 }
 
 type whitelistReq struct {
-	ChannelID   string   `json:"channel_id"`   // 频道ID
+	ChannelId   string   `json:"channel_id"`   // 频道ID
 	ChannelType uint8    `json:"channel_type"` // 频道类型
 	UIDs        []string `json:"uids"`         // 订阅者
 }
 
 func (r whitelistReq) Check() error {
-	if r.ChannelID == "" {
+	if r.ChannelId == "" {
 		return errors.New("channel_id不能为空！")
 	}
-	if IsSpecialChar(r.ChannelID) {
+	if IsSpecialChar(r.ChannelId) {
 		return errors.New("频道ID不能包含特殊字符！")
 	}
 	if r.ChannelType == 0 {
@@ -920,3 +1056,7 @@ func (r tmpSubscriberSetReq) Check() error {
 	}
 	return nil
 }
+
+const (
+	defaultSlotId uint32 = 0 // 默认slotId
+)

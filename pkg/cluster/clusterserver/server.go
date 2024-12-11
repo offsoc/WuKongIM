@@ -18,15 +18,16 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/trace"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
-	"github.com/WuKongIM/WuKongIM/pkg/wknet"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
 	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 	"github.com/bwmarrin/snowflake"
 	"github.com/lni/goutils/syncutil"
 	"github.com/panjf2000/ants/v2"
+	"github.com/panjf2000/gnet/v2"
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
+	"k8s.io/utils/lru"
 )
 
 var _ icluster.Cluster = (*Server)(nil)
@@ -42,32 +43,36 @@ type Server struct {
 	netServer              *wkserver.Server        // 节点之间通讯的网络服务
 	channelElectionPool    *ants.Pool              // 频道选举的协程池
 	channelElectionManager *channelElectionManager // 频道选举管理者
-	channelLoadPool        *ants.Pool              // 加载频道的协程池
-	channelLoadMap         map[string]struct{}     // 频道是否在加载中的map
-	channelLoadMapLock     sync.RWMutex            // 频道是否在加载中的map锁
 	cancelCtx              context.Context
 	cancelFnc              context.CancelFunc
 	onMessageFnc           func(fromNodeId uint64, msg *proto.Message) // 上层处理消息的函数
 	logIdGen               *snowflake.Node                             // 日志id生成
-	slotStorage            *PebbleShardLogStorage
-	apiPrefix              string    // api前缀
-	uptime                 time.Time // 服务器启动时间
+	slotStorage            *PebbleShardLogStorage                      // slot存储
+	apiPrefix              string                                      // api前缀
+	uptime                 time.Time                                   // 服务器启动时间
 	wklog.Log
-
 	stopped atomic.Bool
-
 	stopper *syncutil.Stopper
+
+	channelClusterCache *lru.Cache // 缓存最热的ChannelClusterConfig
+	// 缓存的数据版本，这个版本是全局分布式配置版本，当全局分布式配置的版本大于当前时，应当清除缓存
+	channelClusterCacheVersion uint64
+
+	// 测试ping
+	testPings       map[string]*ping
+	testPingMapLock sync.RWMutex
 }
 
 func New(opts *Options) *Server {
 
 	s := &Server{
-		opts:           opts,
-		nodeManager:    newNodeManager(opts),
-		Log:            wklog.NewWKLog(fmt.Sprintf("cluster[%d]", opts.NodeId)),
-		channelKeyLock: keylock.NewKeyLock(),
-		channelLoadMap: make(map[string]struct{}),
-		stopper:        syncutil.NewStopper(),
+		opts:                opts,
+		nodeManager:         newNodeManager(opts),
+		Log:                 wklog.NewWKLog(fmt.Sprintf("cluster[%d]", opts.NodeId)),
+		channelKeyLock:      keylock.NewKeyLock(), // 创建指定大小的锁环
+		stopper:             syncutil.NewStopper(),
+		channelClusterCache: lru.New(1024),
+		testPings:           make(map[string]*ping),
 	}
 
 	s.slotManager = newSlotManager(s)
@@ -131,19 +136,12 @@ func New(opts *Options) *Server {
 	}
 	s.channelElectionPool = channelElectionPool
 
-	s.channelLoadPool, err = ants.NewPool(s.opts.ChannelLoadPoolSize, ants.WithNonblocking(true), ants.WithPanicHandler(func(err interface{}) {
-		s.Panic("频道加载协程池崩溃", zap.Any("err", err), zap.Stack("stack"))
-	}))
-	if err != nil {
-		s.Panic("new channelLoadPool failed", zap.Error(err))
-	}
-
 	s.netServer = wkserver.New(
 		opts.Addr, wkserver.WithMessagePoolOn(false),
-		wkserver.WithOnRequest(func(conn wknet.Conn, req *proto.Request) {
+		wkserver.WithOnRequest(func(conn gnet.Conn, req *proto.Request) {
 			trace.GlobalTrace.Metrics.System().IntranetIncomingAdd(int64(len(req.Body)))
 		}),
-		wkserver.WithOnResponse(func(conn wknet.Conn, resp *proto.Response) {
+		wkserver.WithOnResponse(func(conn gnet.Conn, resp *proto.Response) {
 			trace.GlobalTrace.Metrics.System().IntranetOutgoingAdd(int64(len(resp.Body)))
 		}),
 	)
@@ -156,12 +154,12 @@ func (s *Server) Start() error {
 
 	s.uptime = time.Now()
 
+	s.channelKeyLock.StartCleanLoop()
+
 	err := s.slotStorage.Open()
 	if err != nil {
 		return err
 	}
-
-	s.channelKeyLock.StartCleanLoop()
 
 	nodes := s.clusterEventServer.Nodes()
 	if len(nodes) > 0 {
@@ -225,7 +223,24 @@ func (s *Server) Start() error {
 		s.stopper.RunWorker(s.joinLoop)
 	}
 
+	// 设置监控数据的observer
+	s.setObservers()
+
 	return nil
+}
+
+func (s *Server) setObservers() {
+	// 收集节点请求中的数据
+	trace.GlobalTrace.Metrics.Cluster().ObserverNodeRequesting(func() int64 {
+
+		return s.nodeManager.requesting()
+	})
+
+	// 收集消息发送中的数量
+	trace.GlobalTrace.Metrics.Cluster().ObserverNodeSending(func() int64 {
+
+		return s.nodeManager.sending()
+	})
 }
 
 func (s *Server) Stop() {
@@ -239,14 +254,15 @@ func (s *Server) Stop() {
 	s.clusterEventServer.Stop()
 	s.slotManager.stop()
 	s.channelManager.stop()
-	s.channelKeyLock.StopCleanLoop()
 	s.slotStorage.Close()
+
+	s.channelKeyLock.StopCleanLoop()
 
 }
 
 // 提案频道分布式配置
-func (s *Server) ProposeChannelClusterConfig(ctx context.Context, cfg wkdb.ChannelClusterConfig) error {
-	return s.opts.ChannelClusterStorage.Propose(ctx, cfg)
+func (s *Server) ProposeChannelClusterConfig(cfg wkdb.ChannelClusterConfig) error {
+	return s.opts.ChannelClusterStorage.Propose(cfg)
 }
 
 // 获取分布式配置
@@ -273,24 +289,13 @@ func (s *Server) AddConfigMessage(m reactor.Message) {
 	s.clusterEventServer.AddMessage(m)
 }
 
-func (s *Server) getOrCreateChannelHandler(handlerKey string) reactor.IHandler {
-	s.channelLoadMapLock.Lock()
-	defer s.channelLoadMapLock.Unlock()
-	handler := s.channelManager.getWithHandleKey(handlerKey)
-	if handler == nil {
-		channelId, channelType := wkutil.ChannelFromlKey(handlerKey)
-		s.channelManager.add(newChannel(channelId, channelType, s))
-	}
-	return handler
-}
-
 func (s *Server) AddChannelMessage(m reactor.Message) {
 
 	// 统计引入的消息
 	traceIncomingMessage(trace.ClusterKindChannel, m.MsgType, int64(m.Size()))
 
 	// 获取或创建频道处理者
-	_ = s.getOrCreateChannelHandler(m.HandlerKey)
+	_ = s.channelManager.getOrCreateIfNotExistWithHandleKey(m.HandlerKey)
 
 	s.channelManager.addMessage(m)
 
@@ -429,7 +434,7 @@ func (s *Server) onSend(m reactor.Message) {
 	s.opts.Send(ShardTypeConfig, m)
 }
 
-func (s *Server) onMessage(c wknet.Conn, m *proto.Message) {
+func (s *Server) onMessage(c gnet.Conn, m *proto.Message) {
 	if s.stopped.Load() {
 		return
 	}
@@ -457,11 +462,13 @@ func (s *Server) onMessage(c wknet.Conn, m *proto.Message) {
 		trace.GlobalTrace.Metrics.Cluster().MessageIncomingBytesAdd(trace.ClusterKindConfig, msgSize)
 		s.AddConfigMessage(msg)
 	case MsgTypeSlot:
+
 		msg, err := reactor.UnmarshalMessage(m.Content)
 		if err != nil {
 			s.Error("UnmarshalMessage failed", zap.Error(err))
 			return
 		}
+
 		trace.GlobalTrace.Metrics.Cluster().MessageIncomingCountAdd(trace.ClusterKindSlot, 1)
 		trace.GlobalTrace.Metrics.Cluster().MessageIncomingBytesAdd(trace.ClusterKindSlot, msgSize)
 		s.AddSlotMessage(msg)
@@ -477,8 +484,24 @@ func (s *Server) onMessage(c wknet.Conn, m *proto.Message) {
 
 	case MsgTypeChannelClusterConfigUpdate: // 频道配置更新
 		go s.handleChannelClusterConfigUpdate(m)
+
+	case MsgTypePing:
+		ping, err := unmarshalPing(m.Content)
+		if err != nil {
+			s.Error("unmarshalPing failed", zap.Error(err))
+			return
+		}
+		s.ping(ping)
+	case MsgTypePong:
+		pong, err := unmarshalPong(m.Content)
+		if err != nil {
+			s.Error("unmarshalPong failed", zap.Error(err))
+			return
+		}
+		s.pong(pong)
+
 	default:
-		fromNodeId := s.uidToServerId(c.UID())
+		fromNodeId := s.uidToServerId(wkserver.GetUidFromContext(c))
 
 		trace.GlobalTrace.Metrics.Cluster().MessageIncomingCountAdd(trace.ClusterKindUnknown, 1)
 		trace.GlobalTrace.Metrics.Cluster().MessageIncomingBytesAdd(trace.ClusterKindUnknown, msgSize)
@@ -486,6 +509,35 @@ func (s *Server) onMessage(c wknet.Conn, m *proto.Message) {
 			s.onMessageFnc(fromNodeId, m) // 这里要注意，消息处理的时候不能阻塞，要不然整个分布式将变慢或卡住
 		}
 	}
+}
+
+func (s *Server) ping(p *ping) {
+
+	pong := &pong{
+		no:        p.no,
+		from:      s.opts.NodeId,
+		startMill: time.Now().UnixMilli(),
+	}
+
+	data := pong.marshal()
+
+	msg := &proto.Message{
+		MsgType: MsgTypePong,
+		Content: data,
+	}
+	err := s.Send(p.from, msg)
+	if err != nil {
+		s.Error("send pong failed", zap.Error(err))
+	}
+}
+
+func (s *Server) pong(p *pong) {
+	s.testPingMapLock.Lock()
+	ping, ok := s.testPings[p.no]
+	if ok {
+		ping.waitC <- p
+	}
+	s.testPingMapLock.Unlock()
 }
 
 // 获取频道所在的slotId

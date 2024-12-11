@@ -29,7 +29,7 @@ func (s *Server) setRoutes() {
 
 	// 获取槽的leader term start index
 	s.netServer.Route("/slot/leaderTermStartIndex", s.handleSlotLeaderTermStartIndex)
-	// 获取频道的leader term start index
+	// 获取频道的leader term start index，follower节点请求领导节点获取领导的term start index
 	s.netServer.Route("/channel/leaderTermStartIndex", s.handleChannelLeaderTermStartIndex)
 
 	// 获取槽日志信息
@@ -103,6 +103,18 @@ func (s *Server) handleClusterconfig(c *wkserver.Context) {
 	if slot == nil {
 		s.Error("slot not found", zap.Uint32("slotId", slotId))
 		c.WriteErr(ErrSlotNotFound)
+		return
+	}
+
+	if req.From == 0 {
+		s.Error("handleClusterconfig: from is 0", zap.Uint64("from", req.From))
+		c.WriteErr(errors.New("handleClusterconfig: from is 0"))
+		return
+	}
+
+	if s.opts.NodeId == req.From {
+		s.Panic("from equal local nodeId, error", zap.Uint64("from", req.From), zap.Uint64("nodeId", s.opts.NodeId))
+		c.WriteErr(errors.New("from equal local nodeId, error"))
 		return
 	}
 
@@ -191,7 +203,7 @@ func (s *Server) handleProposeMessage(c *wkserver.Context) {
 }
 
 func (s *Server) getFrom(c *wkserver.Context) (uint64, error) {
-	return strconv.ParseUint(c.Conn().UID(), 10, 64)
+	return strconv.ParseUint(wkserver.GetUidFromContext(c.Conn()), 10, 64)
 }
 
 func (s *Server) handleSlotPropose(c *wkserver.Context) {
@@ -309,6 +321,12 @@ func (s *Server) handleSlotLeaderTermStartIndex(c *wkserver.Context) {
 		return
 	}
 
+	start := time.Now()
+	defer func() {
+		cost := time.Since(start)
+		s.Info("handleSlotLeaderTermStartIndex too cost", zap.Duration("cost", cost))
+	}()
+
 	resultBytes := make([]byte, 8)
 
 	handler := s.slotManager.slotReactor.Handler(req.HandlerKey)
@@ -354,9 +372,17 @@ func (s *Server) handleChannelLeaderTermStartIndex(c *wkserver.Context) {
 
 	handler := s.channelManager.channelReactor.Handler(req.HandlerKey)
 	if handler == nil {
-		s.Error("handler not found", zap.String("handlerKey", req.HandlerKey))
-		c.WriteErr(errors.New("handler not found"))
-		return
+
+		// 如果不存在，重新激活频道
+		channelId, channelType := wkutil.ChannelFromlKey(req.HandlerKey)
+		timeoutCtx, cancel := context.WithTimeout(s.cancelCtx, time.Second*10)
+		handler, err = s.loadOrCreateChannel(timeoutCtx, channelId, channelType)
+		cancel()
+		if err != nil {
+			s.Error("handler not found", zap.String("handlerKey", req.HandlerKey))
+			c.WriteErr(errors.New("handler not found"))
+			return
+		}
 	}
 
 	lastIndex, term := handler.LastLogIndexAndTerm()

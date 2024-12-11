@@ -27,7 +27,8 @@ type Options struct {
 
 	RequestTimeoutTick int // 请求超时tick数
 
-	OnConfigChange func(oldCfg, newCfg Config) // 配置变更回调
+	RetryTick       int // 重试tick数, 超过此tick数则重试
+	SyncTimeoutTick int // 同步超时的tick数
 }
 
 func NewOptions() *Options {
@@ -45,6 +46,8 @@ func NewOptions() *Options {
 		FollowerToLeaderMinLogGap:  100,
 		LearnerToTimeoutTick:       10,
 		RequestTimeoutTick:         10,
+		RetryTick:                  40,
+		SyncTimeoutTick:            10,
 	}
 }
 
@@ -177,8 +180,14 @@ func WithRequestTimeoutTick(tick int) Option {
 	}
 }
 
-func WithOnConfigChange(f func(oldCfg, newCfg Config)) Option {
+func WithRetryTick(tick int) Option {
 	return func(o *Options) {
-		o.OnConfigChange = f
+		o.RetryTick = tick
+	}
+}
+
+func WithSyncTimeoutTick(tick int) Option {
+	return func(o *Options) {
+		o.SyncTimeoutTick = tick
 	}
 }

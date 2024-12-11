@@ -4,10 +4,12 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/replica"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 	"github.com/sasha-s/go-deadlock"
+	"github.com/valyala/fastrand"
 	"go.uber.org/zap"
 )
 
@@ -16,21 +18,24 @@ type userHandler struct {
 	uid      string
 	actions  []UserAction
 
-	authing   bool          // 正在认证
-	authQueue *userMsgQueue // 认证消息队列
-
 	conns []*connContext
 
 	connNodeIds []uint64 // 连接涉及到的节点id集合
 
-	sendPing  bool          // 正在发送ping
-	pingQueue *userMsgQueue // ping消息队列
+	pingState *replica.ReadyState // 正在发送ping
+	pingQueue *userMsgQueue       // ping消息队列
 
-	sendRecvacking bool          // 正在发送ack
-	recvackQueue   *userMsgQueue // 接收ack的队列
+	// 认证
+	authState *replica.ReadyState // 正在认证
+	authQueue *userMsgQueue       // 认证消息队列
 
-	recvMsging   bool          // 正在收消息
-	recvMsgQueue *userMsgQueue // 接收消息的队列
+	// 接收ack
+	recvackState *replica.ReadyState // 发送ack
+	recvackQueue *userMsgQueue       // 接收ack的队列
+
+	// 收消息
+	recvMsgState *replica.ReadyState
+	recvMsgQueue *userMsgQueue
 
 	leaderId uint64 // 用户所在的领导节点
 
@@ -47,12 +52,15 @@ type userHandler struct {
 	nodePingTick        int            // 节点ping计时
 	nodePongTimeoutTick map[uint64]int // 节点pong超时计时
 
-	initTick        int // 初始化tick计时
-	authTick        int // auth tick 计时
-	sendRecvackTick int // 发送recvack计时
-	recvMsgTick     int // 接收消息计时
+	initState *replica.ReadyState // 初始化状态
+	// authTick int // auth tick 计时
+	// sendRecvackTick int // 发送recvack计时
+	// recvMsgTick int // 接收消息计时
 
-	checkLeaderTick int // 定时检查正确的领导节点
+	checkLeaderTick            int // 定时检查正确的领导节点
+	maxCheckLeaderIntervalTick int
+	maxNodePingTick            int
+	maxNodePongTimeoutTick     int
 
 	wklog.Log
 
@@ -62,32 +70,52 @@ type userHandler struct {
 func newUserHandler(uid string, sub *userReactorSub) *userHandler {
 
 	opts := sub.r.s.opts
+
+	// 以避免系统中因定时器、周期性任务或请求间隔完全一致而导致的同步问题（例如拥堵或资源竞争）。
+	p := float64(fastrand.Uint32()) / (1 << 32)
+	checkLeaderJitter := p * float64(opts.Reactor.User.CheckLeaderIntervalTick)
+	maxCheckLeaderIntervalTick := opts.Reactor.User.CheckLeaderIntervalTick + int(checkLeaderJitter)
+
+	p = float64(fastrand.Uint32()) / (1 << 32)
+	nodePingTickJitter := p * float64(opts.Reactor.User.NodePingTick)
+
+	maxNodePingTick := opts.Reactor.User.NodePingTick + int(nodePingTickJitter)
+
+	p = float64(fastrand.Uint32()) / (1 << 32)
+	nodePongTimeoutJitter := p * float64(opts.Reactor.User.NodePongTimeoutTick)
+
+	maxNodePongTimeoutTick := opts.Reactor.User.NodePongTimeoutTick + int(nodePongTimeoutJitter)
+
+	retryTickCount := 20
 	u := &userHandler{
-		uid:                 uid,
-		authQueue:           newUserMsgQueue(fmt.Sprintf("user:auth:%s", uid)),
-		pingQueue:           newUserMsgQueue(fmt.Sprintf("user:ping:%s", uid)),
-		recvackQueue:        newUserMsgQueue(fmt.Sprintf("user:recvack:%s", uid)),
-		recvMsgQueue:        newUserMsgQueue(fmt.Sprintf("user:recv:%s", uid)),
-		Log:                 wklog.NewWKLog(fmt.Sprintf("userHandler[%d][%s]", sub.r.s.opts.Cluster.NodeId, uid)),
-		sub:                 sub,
-		nodePongTimeoutTick: make(map[uint64]int),
-		uniqueNo:            wkutil.GenUUID(),
-		opts:                opts,
-		initTick:            opts.Reactor.User.ProcessIntervalTick,
+		uid:                        uid,
+		authQueue:                  newUserMsgQueue(fmt.Sprintf("user:auth:%s", uid)),
+		pingQueue:                  newUserMsgQueue(fmt.Sprintf("user:ping:%s", uid)),
+		recvackQueue:               newUserMsgQueue(fmt.Sprintf("user:recvack:%s", uid)),
+		recvMsgQueue:               newUserMsgQueue(fmt.Sprintf("user:recv:%s", uid)),
+		Log:                        wklog.NewWKLog(fmt.Sprintf("userHandler[%d][%s]", sub.r.s.opts.Cluster.NodeId, uid)),
+		sub:                        sub,
+		nodePongTimeoutTick:        make(map[uint64]int),
+		uniqueNo:                   wkutil.GenUUID(),
+		opts:                       opts,
+		initState:                  replica.NewReadyState(retryTickCount),
+		pingState:                  replica.NewReadyState(retryTickCount),
+		authState:                  replica.NewReadyState(retryTickCount),
+		recvackState:               replica.NewReadyState(retryTickCount),
+		recvMsgState:               replica.NewReadyState(retryTickCount),
+		maxCheckLeaderIntervalTick: maxCheckLeaderIntervalTick,
+		maxNodePingTick:            maxNodePingTick,
+		maxNodePongTimeoutTick:     maxNodePongTimeoutTick,
 	}
 
-	u.Info("new user handler")
 	return u
 }
 
 func (u *userHandler) hasReady() bool {
-	if !u.isInitialized() {
-		if u.initTick < u.opts.Reactor.User.ProcessIntervalTick {
-			return false
-		}
-		return u.status != userStatusInitializing
-	}
+	if u.isUninitialized() {
 
+		return true
+	}
 	if u.hasAuth() {
 		return true
 	}
@@ -107,25 +135,24 @@ func (u *userHandler) hasReady() bool {
 }
 
 func (u *userHandler) ready() userReady {
-	if !u.isInitialized() {
-		if u.status == userStatusInitializing {
-			return userReady{}
+	if u.isUninitialized() {
+		if !u.initState.IsProcessing() {
+			u.initState.StartProcessing()
+			u.actions = append(u.actions, UserAction{UniqueNo: u.uniqueNo, ActionType: UserActionInit})
 		}
-		u.initTick = 0
-		u.status = userStatusInitializing
-		u.actions = append(u.actions, UserAction{UniqueNo: u.uniqueNo, ActionType: UserActionInit})
+
 	} else {
 		if u.role == userRoleLeader {
 			// 连接认证
 			if u.hasAuth() {
-				u.authing = true
+				u.authState.StartProcessing()
 				msgs := u.authQueue.sliceWithSize(u.authQueue.processingIndex+1, u.authQueue.lastIndex+1, 0)
 				u.actions = append(u.actions, UserAction{UniqueNo: u.uniqueNo, ActionType: UserActionAuth, Messages: msgs})
-				u.Info("send auth...")
+				u.Debug("send auth...")
 			}
 			// 发送ping
 			if u.hasPing() {
-				u.sendPing = true
+				u.pingState.StartProcessing()
 				msgs := u.pingQueue.sliceWithSize(u.pingQueue.processingIndex+1, u.pingQueue.lastIndex+1, 0)
 				u.actions = append(u.actions, UserAction{UniqueNo: u.uniqueNo, ActionType: UserActionPing, Messages: msgs})
 				// u.Info("send ping...")
@@ -133,7 +160,7 @@ func (u *userHandler) ready() userReady {
 
 			// 发送recvack
 			if u.hasRecvack() {
-				u.sendRecvacking = true
+				u.recvackState.StartProcessing()
 				msgs := u.recvackQueue.sliceWithSize(u.recvackQueue.processingIndex+1, u.recvackQueue.lastIndex+1, 0)
 				u.actions = append(u.actions, UserAction{UniqueNo: u.uniqueNo, ActionType: UserActionRecvack, Messages: msgs})
 				// u.Info("send recvack...")
@@ -142,7 +169,7 @@ func (u *userHandler) ready() userReady {
 		} else {
 			// 转发用户action
 			if u.hasRecvack() {
-				u.sendRecvacking = true
+				u.recvackState.StartProcessing()
 				msgs := u.recvackQueue.sliceWithSize(u.recvackQueue.processingIndex+1, u.recvackQueue.lastIndex+1, 0)
 				u.actions = append(u.actions, UserAction{
 					UniqueNo:   u.uniqueNo,
@@ -158,7 +185,7 @@ func (u *userHandler) ready() userReady {
 			}
 			// 转发连接认证消息
 			if u.hasAuth() {
-				u.authing = true
+				u.authState.StartProcessing()
 				msgs := u.authQueue.sliceWithSize(u.authQueue.processingIndex+1, u.authQueue.lastIndex+1, 0)
 				u.actions = append(u.actions, UserAction{
 					UniqueNo:   u.uniqueNo,
@@ -171,13 +198,13 @@ func (u *userHandler) ready() userReady {
 						Messages:   msgs,
 					},
 				})
-				u.Info("forward auth...")
+				u.Debug("forward auth...")
 			}
 
 		}
 		// 接受消息
 		if u.hasRecvMsg() {
-			u.recvMsging = true
+			u.recvMsgState.StartProcessing()
 			msgs := u.recvMsgQueue.sliceWithSize(u.recvMsgQueue.processingIndex+1, u.recvMsgQueue.lastIndex+1, 0)
 			u.actions = append(u.actions, UserAction{UniqueNo: u.uniqueNo, ActionType: UserActionRecv, Messages: msgs})
 			// u.Info("recv msg...", zap.Int("msgCount", len(msgs)))
@@ -193,7 +220,7 @@ func (u *userHandler) ready() userReady {
 }
 
 func (u *userHandler) hasRecvack() bool {
-	if u.sendRecvacking {
+	if u.recvackState.IsProcessing() {
 		return false
 	}
 
@@ -201,7 +228,7 @@ func (u *userHandler) hasRecvack() bool {
 }
 
 func (u *userHandler) hasAuth() bool {
-	if u.authing {
+	if u.authState.IsProcessing() {
 		return false
 	}
 
@@ -209,14 +236,14 @@ func (u *userHandler) hasAuth() bool {
 }
 
 func (u *userHandler) hasPing() bool {
-	if u.sendPing {
+	if u.pingState.IsProcessing() {
 		return false
 	}
 	return u.pingQueue.processingIndex < u.pingQueue.lastIndex
 }
 
 func (u *userHandler) hasRecvMsg() bool {
-	if u.recvMsging {
+	if u.recvMsgState.IsProcessing() {
 		return false
 	}
 
@@ -224,10 +251,10 @@ func (u *userHandler) hasRecvMsg() bool {
 
 }
 
-// 是否已初始化
-func (u *userHandler) isInitialized() bool {
+// 是否未初始化
+func (u *userHandler) isUninitialized() bool {
 
-	return u.status == userStatusInitialized
+	return u.status == userStatusUninitialized
 }
 
 func (u *userHandler) becomeLeader() {
@@ -236,7 +263,7 @@ func (u *userHandler) becomeLeader() {
 	u.role = userRoleLeader
 	u.stepFnc = u.stepLeader
 	u.tickFnc = u.tickLeader
-	u.Info("become logic leader")
+	u.Debug("become logic leader")
 }
 
 func (u *userHandler) becomeProxy(leaderId uint64) {
@@ -246,7 +273,7 @@ func (u *userHandler) becomeProxy(leaderId uint64) {
 	u.stepFnc = u.stepProxy
 	u.tickFnc = u.tickProxy
 
-	u.Info("become logic proxy", zap.Uint64("leaderId", u.leaderId))
+	u.Debug("become logic proxy", zap.Uint64("leaderId", u.leaderId))
 }
 
 func (u *userHandler) reset() {
@@ -266,13 +293,13 @@ func (u *userHandler) reset() {
 	u.recvMsgQueue.resetIndex()
 	u.authQueue.resetIndex()
 
-	u.sendPing = false
-	u.sendRecvacking = false
-	u.recvMsging = false
-	u.authing = false
+	u.initState.Reset()
+	u.pingState.Reset()
+	u.recvackState.Reset()
+	u.recvMsgState.Reset()
+	u.authState.Reset()
 
-	u.initTick = u.opts.Reactor.User.ProcessIntervalTick
-	u.authTick = 0
+	// u.authTick = 0
 
 	u.nodePingTick = 0
 	u.nodePongTimeoutTick = make(map[uint64]int)
@@ -280,28 +307,32 @@ func (u *userHandler) reset() {
 
 func (u *userHandler) tick() {
 
-	u.initTick++
-	u.authTick++
-	u.recvMsgTick++
-	u.sendRecvackTick++
+	u.initState.Tick()
 
-	u.checkLeaderTick++
+	u.authState.Tick()
+
+	u.pingState.Tick()
+
+	u.recvackState.Tick()
+
+	u.recvMsgState.Tick()
 
 	// if u.authing && u.authTick > u.sub.r.s.opts.Reactor.User.ProcessIntervalTick {
 	// 	u.authing = false
 	// 	u.authTick = 0
 	// }
-	if u.sendRecvacking && u.sendRecvackTick > u.sub.r.s.opts.Reactor.User.ProcessIntervalTick {
-		u.sendRecvacking = false
-		u.sendRecvackTick = 0
-	}
-	if u.recvMsging && u.recvMsgTick > u.sub.r.s.opts.Reactor.User.ProcessIntervalTick {
-		u.recvMsging = false
-		u.recvMsgTick = 0
-	}
+	// if u.sendRecvacking && u.sendRecvackTick > u.sub.r.s.opts.Reactor.User.ProcessIntervalTick {
+	// 	u.sendRecvacking = false
+	// 	u.sendRecvackTick = 0
+	// }
+	// if u.recvMsging && u.recvMsgTick > u.sub.r.s.opts.Reactor.User.ProcessIntervalTick {
+	// 	u.recvMsging = false
+	// 	u.recvMsgTick = 0
+	// }
 
 	// 定时校验领导的正确性
-	if u.checkLeaderTick >= u.sub.r.s.opts.Reactor.User.CheckLeaderIntervalTick {
+	u.checkLeaderTick++
+	if u.checkLeaderTick >= u.maxCheckLeaderIntervalTick {
 		u.checkLeaderTick = 0
 		u.actions = append(u.actions, UserAction{UniqueNo: u.uniqueNo, ActionType: UserActionCheckLeader, Uid: u.uid})
 	}
@@ -314,7 +345,8 @@ func (u *userHandler) tick() {
 
 func (u *userHandler) tickProxy() {
 	u.nodePingTick++
-	if u.nodePingTick >= u.sub.r.s.opts.Reactor.User.NodePingTick+(u.sub.r.s.opts.Reactor.User.NodePingTick/2) { // 与领导失去联系，主动断开连接
+	if u.nodePingTick >= u.maxNodePingTick { // 与领导失去联系，主动断开连接
+		u.Debug("nodePingTick timeout", zap.String("uid", u.uid), zap.Int("nodePingTick", u.nodePingTick))
 		u.nodePingTick = 0
 		u.actions = append(u.actions, UserAction{UniqueNo: u.uniqueNo, ActionType: UserActionClose, Uid: u.uid})
 	}
@@ -327,12 +359,13 @@ func (u *userHandler) tickLeader() {
 		u.nodePongTimeoutTick[proxyNodeId]++
 	}
 
-	if u.nodePingTick >= u.sub.r.s.opts.Reactor.User.NodePingTick {
+	if u.nodePingTick >= u.maxNodePingTick/3 { // 领导发送ping
 		u.nodePingTick = 0
 		var messages []ReactorUserMessage
+		// TODO: u.conns可能存在竞锁问题
 		if len(u.conns) > 0 {
 			for _, c := range u.conns {
-				if c.realNodeId == 0 || c.realNodeId == c.subReactor.r.s.opts.Cluster.NodeId {
+				if c.isRealConn {
 					continue
 				}
 				messages = append(messages, ReactorUserMessage{
@@ -354,8 +387,8 @@ func (u *userHandler) tickLeader() {
 
 	// 检查代理节点是否超时
 	for _, proxyNodeId := range u.connNodeIds {
-		if u.nodePongTimeoutTick[proxyNodeId] >= u.sub.r.s.opts.Reactor.User.NodePongTimeoutTick {
-			u.Debug("user node pong timeout", zap.String("uid", u.uid), zap.Uint64("proxyNodeId", proxyNodeId))
+		if u.nodePongTimeoutTick[proxyNodeId] >= u.maxNodePingTick {
+			u.Info("user node pong timeout", zap.String("uid", u.uid), zap.Uint64("proxyNodeId", proxyNodeId))
 			u.actions = append(u.actions, UserAction{ActionType: UserActionProxyNodeTimeout, Uid: u.uid, Messages: []ReactorUserMessage{
 				{FromNodeId: proxyNodeId},
 			}})

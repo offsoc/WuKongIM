@@ -16,6 +16,7 @@ import (
 	"github.com/cockroachdb/pebble"
 	"github.com/lni/goutils/syncutil"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 )
 
 var _ DB = (*wukongDB)(nil)
@@ -34,6 +35,8 @@ type wukongDB struct {
 	cancelCtx    context.Context
 	cancelFunc   context.CancelFunc
 
+	metrics trace.IDBMetrics
+
 	h hash.Hash32
 }
 
@@ -50,6 +53,7 @@ func NewWukongDB(opts *Options) DB {
 		endian:       binary.BigEndian,
 		cancelCtx:    cancelCtx,
 		cancelFunc:   cancelFunc,
+		metrics:      trace.GlobalTrace.Metrics.DB(),
 		h:            fnv.New32(),
 		sync: &pebble.WriteOptions{
 			Sync: true,
@@ -107,12 +111,12 @@ func (wk *wukongDB) Open() error {
 		}
 		wk.dbs = append(wk.dbs, db)
 
-		wkdb := NewBatchDB(db)
+		wkdb := NewBatchDB(i, db)
 		wkdb.Start()
 		wk.wkdbs = append(wk.wkdbs, wkdb)
 	}
 
-	go wk.collectMetricsLoop()
+	// go wk.collectMetricsLoop()
 
 	return nil
 }
@@ -267,19 +271,66 @@ func (wk *wukongDB) NextPrimaryKey() uint64 {
 	return uint64(wk.prmaryKeyGen.Generate().Int64())
 }
 
+// 批量提交
+func Commits(bs []*Batch) error {
+	if len(bs) == 0 {
+		return nil
+	}
+	newBatchs := groupBatch(bs)
+	if len(newBatchs) == 1 {
+		return newBatchs[0].CommitWait()
+	}
+
+	timeoutCtx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	g, _ := errgroup.WithContext(timeoutCtx)
+	g.SetLimit(200)
+	for _, b := range newBatchs {
+		b1 := b
+		g.Go(func() error {
+			return b1.CommitWait()
+		})
+	}
+	return g.Wait()
+}
+
+// 将batch集合操作按照db进行聚合到一起
+
+func groupBatch(bs []*Batch) []*Batch {
+	newBatchs := make([]*Batch, 0, len(bs))
+	for _, b := range bs {
+		exist := false
+		for _, nb := range newBatchs {
+			if nb.db == b.db {
+				exist = true
+				nb.setKvs = append(nb.setKvs, b.setKvs...)
+				nb.delKvs = append(nb.delKvs, b.delKvs...)
+				nb.delRangeKvs = append(nb.delRangeKvs, b.delRangeKvs...)
+				break
+			}
+		}
+		if !exist {
+			newBatchs = append(newBatchs, b)
+		}
+	}
+	return newBatchs
+}
+
 type BatchDB struct {
 	db *pebble.DB
 
 	batchChan chan *Batch
 
 	stopper *syncutil.Stopper
+	Index   int
 }
 
-func NewBatchDB(db *pebble.DB) *BatchDB {
+func NewBatchDB(index int, db *pebble.DB) *BatchDB {
 	return &BatchDB{
 		batchChan: make(chan *Batch, 4000),
 		stopper:   syncutil.NewStopper(),
 		db:        db,
+		Index:     index,
 	}
 }
 
@@ -301,18 +352,21 @@ func (wk *BatchDB) Stop() {
 }
 
 func (wk *BatchDB) loop() {
+	batchSize := 100
 	done := false
-	batches := make([]*Batch, 0, 100)
+	batches := make([]*Batch, 0, batchSize)
 	for {
 		select {
 		case bt := <-wk.batchChan:
-
 			// 获取所有的batch
 			batches = append(batches, bt)
 			for !done {
 				select {
 				case b := <-wk.batchChan:
 					batches = append(batches, b)
+					if len(batches) >= batchSize {
+						done = true
+					}
 				default:
 					done = true
 				}
@@ -338,6 +392,10 @@ func (wk *BatchDB) executeBatch(bs []*Batch) {
 
 		// fmt.Println("batch-->:", b.String())
 
+		trace.GlobalTrace.Metrics.DB().SetAdd(int64(len(b.setKvs)))
+		trace.GlobalTrace.Metrics.DB().DeleteAdd(int64(len(b.delKvs)))
+		trace.GlobalTrace.Metrics.DB().DeleteRangeAdd(int64(len(b.delRangeKvs)))
+
 		for _, kv := range b.delKvs {
 			if err := bt.Delete(kv.key, pebble.NoSync); err != nil {
 				b.err = err
@@ -360,6 +418,7 @@ func (wk *BatchDB) executeBatch(bs []*Batch) {
 		}
 
 	}
+	trace.GlobalTrace.Metrics.DB().CommitAdd(1)
 	err := bt.Commit(pebble.Sync)
 	if err != nil {
 		for _, b := range bs {
@@ -392,6 +451,10 @@ type Batch struct {
 }
 
 func (b *Batch) Set(key, value []byte) {
+	// 预分配切片容量
+	if cap(b.setKvs) == 0 {
+		b.setKvs = make([]kv, 0, 100) // 假设预估大小为100
+	}
 	b.setKvs = append(b.setKvs, kv{
 		key: key,
 		val: value,
@@ -425,6 +488,10 @@ func (b *Batch) CommitWait() error {
 
 func (b *Batch) String() string {
 	return fmt.Sprintf("setKvs:%d, delKvs:%d, delRangeKvs:%d", len(b.setKvs), len(b.delKvs), len(b.delRangeKvs))
+}
+
+func (b *Batch) DbIndex() int {
+	return b.db.Index
 }
 
 type kv struct {

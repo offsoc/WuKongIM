@@ -127,6 +127,7 @@ func (s *ConversationAPI) clearConversationUnread(c *wkhttp.Context) {
 		createdAt := time.Now()
 		updatedAt := time.Now()
 		conversation = wkdb.Conversation{
+			Type:        wkdb.ConversationTypeChat,
 			Uid:         req.UID,
 			ChannelId:   fakeChannelId,
 			ChannelType: req.ChannelType,
@@ -148,7 +149,7 @@ func (s *ConversationAPI) clearConversationUnread(c *wkhttp.Context) {
 
 	}
 
-	err = s.s.store.AddOrUpdateConversations(req.UID, []wkdb.Conversation{conversation})
+	err = s.s.store.AddOrUpdateUserConversations(req.UID, []wkdb.Conversation{conversation})
 	if err != nil {
 		s.Error("Failed to add conversation", zap.Error(err))
 		c.ResponseError(err)
@@ -166,7 +167,6 @@ func (s *ConversationAPI) setConversationUnread(c *wkhttp.Context) {
 		ChannelID   string `json:"channel_id"`
 		ChannelType uint8  `json:"channel_type"`
 		Unread      int    `json:"unread"`
-		MessageSeq  uint32 `json:"message_seq"` // messageSeq 只有超大群才会传 因为超大群最近会话服务器不会维护，需要客户端传递messageSeq进行主动维护
 	}
 	bodyBytes, err := BindJSON(&req, c)
 	if err != nil {
@@ -224,6 +224,7 @@ func (s *ConversationAPI) setConversationUnread(c *wkhttp.Context) {
 		updatedAt := time.Now()
 		conversation = wkdb.Conversation{
 			Uid:         req.UID,
+			Type:        wkdb.ConversationTypeChat,
 			ChannelId:   fakeChannelId,
 			ChannelType: req.ChannelType,
 			CreatedAt:   &createdAt,
@@ -246,7 +247,7 @@ func (s *ConversationAPI) setConversationUnread(c *wkhttp.Context) {
 	conversation.ReadToMsgSeq = readedMsgSeq
 	conversation.UnreadCount = unread
 
-	err = s.s.store.AddOrUpdateConversations(req.UID, []wkdb.Conversation{conversation})
+	err = s.s.store.AddOrUpdateUserConversations(req.UID, []wkdb.Conversation{conversation})
 	if err != nil {
 		s.Error("Failed to add conversation", zap.Error(err))
 		c.ResponseError(err)
@@ -370,6 +371,8 @@ func (s *ConversationAPI) syncUserConversation(c *wkhttp.Context) {
 		}
 	}
 
+	// conversations里去掉重复的
+
 	// 获取真实的频道ID
 	getRealChannelId := func(fakeChannelId string, channelType uint8) string {
 		realChannelId := fakeChannelId
@@ -383,6 +386,9 @@ func (s *ConversationAPI) syncUserConversation(c *wkhttp.Context) {
 		}
 		return realChannelId
 	}
+
+	// 去掉重复的会话
+	conversations = removeDuplicates(conversations)
 
 	// 设置最近会话已读至的消息序列号
 	for _, conversation := range conversations {
@@ -456,6 +462,20 @@ func (s *ConversationAPI) syncUserConversation(c *wkhttp.Context) {
 	}
 
 	c.JSON(http.StatusOK, resps)
+}
+
+func removeDuplicates(conversations []wkdb.Conversation) []wkdb.Conversation {
+	seen := make(map[string]bool)
+	result := []wkdb.Conversation{}
+
+	for _, conversation := range conversations {
+		channelKey := wkutil.ChannelToKey(conversation.ChannelId, conversation.ChannelType)
+		if !seen[channelKey] {
+			seen[channelKey] = true
+			result = append(result, conversation)
+		}
+	}
+	return result
 }
 
 func (s *ConversationAPI) getChannelLastMsgSeqMap(lastMsgSeqs string) map[string]uint64 {

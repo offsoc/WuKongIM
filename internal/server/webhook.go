@@ -34,11 +34,12 @@ type webhook struct {
 	stoped           chan struct{}
 	onlinestatusLock sync.RWMutex
 	onlinestatusList []string
+	focusEvents      map[string]struct{} // 用户关注的事件类型,如果为空则推送所有类型
 }
 
 func newWebhook(s *Server) *webhook {
 	eventPool, err := ants.NewPool(s.opts.EventPoolSize, ants.WithPanicHandler(func(err interface{}) {
-		s.Error("webhook panic", zap.Any("err", err), zap.Stack("stack"))
+		s.Panic("webhook panic", zap.Any("err", err), zap.Stack("stack"))
 	}))
 	if err != nil {
 		panic(err)
@@ -58,6 +59,20 @@ func newWebhook(s *Server) *webhook {
 		}
 
 	}
+
+	// 检查用户配置了关注的事件
+	var focusEvents = make(map[string]struct{})
+	if len(s.opts.Webhook.FocusEvents) > 0 {
+		for _, focusEvent := range s.opts.Webhook.FocusEvents {
+			if focusEvent == "" {
+				continue
+			}
+			if _, ok := eventWebHook[focusEvent]; ok {
+				focusEvents[focusEvent] = struct{}{}
+			}
+		}
+	}
+
 	return &webhook{
 		s:                s,
 		Log:              wklog.NewWKLog("Webhook"),
@@ -80,6 +95,7 @@ func newWebhook(s *Server) *webhook {
 				ExpectContinueTimeout: 1 * time.Second,
 			},
 		},
+		focusEvents: focusEvents,
 	}
 }
 
@@ -114,7 +130,7 @@ func (w *webhook) Offline(uid string, deviceFlag wkproto.DeviceFlag, connId int6
 
 // TriggerEvent 触发事件
 func (w *webhook) TriggerEvent(event *Event) {
-	if !w.s.opts.WebhookOn() { // 没设置webhook直接忽略
+	if !w.s.opts.WebhookOn(event.Event) { // 没设置webhook直接忽略
 		return
 	}
 	err := w.eventPool.Submit(func() {
@@ -194,11 +210,16 @@ func (w *webhook) notifyQueueLoop() {
 	ticker := time.NewTicker(w.s.opts.Webhook.MsgNotifyEventPushInterval)
 	defer ticker.Stop()
 	errMessageIDMap := make(map[int64]int) // 记录错误的消息ID value为错误次数
-	if w.s.opts.WebhookOn() {
+	if w.s.opts.WebhookOn(EventMsgNotify) {
 		for {
 			messages, err := w.s.store.GetMessagesOfNotifyQueue(w.s.opts.Webhook.MsgNotifyEventCountPerPush)
 			if err != nil {
 				w.Error("获取通知队列内的消息失败！", zap.Error(err))
+				// 如果系统出现错误，就移除第一个
+				err = w.s.store.DB().RemoveMessagesOfNotifyQueueCount(1)
+				if err != nil {
+					w.Error("RemoveMessagesOfNotifyQueueCount: 移除通知对列消息失败！", zap.Error(err))
+				}
 				time.Sleep(errorSleepTime) // 如果报错就休息下
 				continue
 			}
@@ -271,7 +292,7 @@ func (w *webhook) notifyQueueLoop() {
 }
 
 func (w *webhook) loopOnlineStatus() {
-	if !w.s.opts.WebhookOn() {
+	if !w.s.opts.WebhookOn(EventOnlineStatus) {
 		return
 	}
 	opLen := 0    // 最后一次操作在线状态数组的长度
@@ -382,6 +403,7 @@ func (w *webhook) sendWebhookForGRPC(event string, data []byte) error {
 	return nil
 }
 
+
 const (
 	// EventMsgOffline 离线消息
 	EventMsgOffline = "msg.offline"
@@ -389,6 +411,15 @@ const (
 	EventMsgNotify = "msg.notify"
 	// EventOnlineStatus 用户在线状态
 	EventOnlineStatus = "user.onlinestatus"
+)
+
+var (
+	// eventWebHook 用于快速校验用用户配置的关注事件
+	eventWebHook = map[string]map[string]struct{}{
+		EventMsgOffline:   {},
+		EventMsgNotify:    {},
+		EventOnlineStatus: {},
+	}
 )
 
 // Event Event

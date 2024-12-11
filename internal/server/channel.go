@@ -1,12 +1,17 @@
 package server
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/replica"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
+	"github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
 	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 	"go.uber.org/atomic"
@@ -52,22 +57,29 @@ type channel struct {
 	stepFnc func(*ChannelAction) error
 	tickFnc func()
 
-	payloadDecrypting  bool // 是否正在解密
-	permissionChecking bool // 是否正在检查权限
-	storaging          bool // 是否正在存储
-	sendacking         bool // 是否正在发送回执
-	delivering         bool // 是否正在投递
-	forwarding         bool // 是否正在转发
+	// init
+	initState *replica.ReadyState
+	// 解密
+	payloadDecryptState *replica.ReadyState
+	// 检查权限
+	permissionCheckState *replica.ReadyState
+	// 存储
+	storageState *replica.ReadyState
+	// 发送回执
+	sendackState *replica.ReadyState
+	// 投递
+	deliveryState *replica.ReadyState
+	// 转发
+	forwardState *replica.ReadyState
 
 	// 计时tick
-	initTick               int // 发起初始化的tick计时
-	payloadDecryptingTick  int // 发起解密的tick计时
-	permissionCheckingTick int // 发起权限检查的tick计时
+	// payloadDecryptingTick  int // 发起解密的tick计时
+	// permissionCheckingTick int // 发起权限检查的tick计时
 
-	storageTick    int // 发起存储的tick计时
-	forwardTick    int // 发起转发的tick计时
-	deliveringTick int // 发起投递的tick计时
-	sendackingTick int // 发起发送回执的tick计时
+	// storageTick int // 发起存储的tick计时
+	forwardTick int // 发起转发的tick计时
+	// deliveringTick int // 发起投递的tick计时
+	// sendackingTick int // 发起发送回执的tick计时
 
 	tagCheckTick int // tag检查的tick计时
 
@@ -79,33 +91,35 @@ type channel struct {
 func newChannel(sub *channelReactorSub, channelId string, channelType uint8) *channel {
 	key := wkutil.ChannelToKey(channelId, channelType)
 
+	retryTickCount := 20
 	return &channel{
-		key:            key,
-		uniqueNo:       wkutil.GenUUID(),
-		channelId:      channelId,
-		channelType:    channelType,
-		msgQueue:       newChannelMsgQueue(channelId),
-		streams:        newStreamList(),
-		storageMaxSize: 1024 * 1024 * 2,
-		deliverMaxSize: 1024 * 1024 * 2,
-		forwardMaxSize: 1024 * 1024 * 2,
-		Log:            wklog.NewWKLog(fmt.Sprintf("channelHandler[%d][%s]", sub.r.opts.Cluster.NodeId, key)),
-		r:              sub.r,
-		sub:            sub,
-		opts:           sub.r.opts,
-		initTick:       sub.r.opts.Reactor.Channel.ProcessIntervalTick,
+		key:                  key,
+		uniqueNo:             wkutil.GenUUID(),
+		channelId:            channelId,
+		channelType:          channelType,
+		msgQueue:             newChannelMsgQueue(channelId),
+		streams:              newStreamList(),
+		storageMaxSize:       1024 * 1024 * 2,
+		deliverMaxSize:       1024 * 1024 * 2,
+		forwardMaxSize:       1024 * 1024 * 2,
+		Log:                  wklog.NewWKLog(fmt.Sprintf("channelHandler[%d][%s]", sub.r.opts.Cluster.NodeId, key)),
+		r:                    sub.r,
+		sub:                  sub,
+		opts:                 sub.r.opts,
+		initState:            replica.NewReadyState(retryTickCount),
+		payloadDecryptState:  replica.NewReadyState(retryTickCount),
+		permissionCheckState: replica.NewReadyState(retryTickCount),
+		storageState:         replica.NewReadyState(retryTickCount),
+		sendackState:         replica.NewReadyState(retryTickCount),
+		deliveryState:        replica.NewReadyState(retryTickCount),
+		forwardState:         replica.NewReadyState(retryTickCount),
 	}
 
 }
 
 func (c *channel) hasReady() bool {
-	if !c.isInitialized() { // 是否初始化
-
-		if c.initTick < c.opts.Reactor.Channel.ProcessIntervalTick {
-			return false
-		}
-
-		return c.status != channelStatusInitializing
+	if c.isUninitialized() { // 是否初始化
+		return true
 	}
 
 	if c.hasPayloadUnDecrypt() || c.streams.hasPayloadUnDecrypt() { // 有未解密的消息
@@ -137,18 +151,16 @@ func (c *channel) hasReady() bool {
 
 func (c *channel) ready() ready {
 
-	if !c.isInitialized() {
-		if c.status == channelStatusInitializing {
-			return ready{}
+	if c.isUninitialized() {
+		if !c.initState.IsProcessing() {
+			c.initState.StartProcessing()
+			c.exec(&ChannelAction{ActionType: ChannelActionInit})
 		}
-		c.status = channelStatusInitializing
-		c.initTick = 0
-		c.exec(&ChannelAction{ActionType: ChannelActionInit})
 	} else {
 
 		// 解密消息
 		if c.hasPayloadUnDecrypt() {
-			c.payloadDecrypting = true
+			c.payloadDecryptState.StartProcessing()
 			msgs := c.msgQueue.sliceWithSize(c.msgQueue.payloadDecryptingIndex+1, c.msgQueue.lastIndex+1, 1024*1024*2)
 			if len(msgs) > 0 {
 				c.exec(&ChannelAction{ActionType: ChannelActionPayloadDecrypt, Messages: msgs})
@@ -156,18 +168,18 @@ func (c *channel) ready() ready {
 		}
 
 		// 流消息解密
-		if c.streams.hasPayloadUnDecrypt() {
-			msgs := c.streams.payloadUnDecryptMessages()
-			if len(msgs) > 0 {
-				c.exec(&ChannelAction{ActionType: ChannelActionStreamPayloadDecrypt, Messages: msgs})
-			}
-		}
+		// if c.streams.hasPayloadUnDecrypt() {
+		// 	msgs := c.streams.payloadUnDecryptMessages()
+		// 	if len(msgs) > 0 {
+		// 		c.exec(&ChannelAction{ActionType: ChannelActionStreamPayloadDecrypt, Messages: msgs})
+		// 	}
+		// }
 
 		if c.role == channelRoleLeader {
 
 			// 如果没有权限检查的则去检查权限
 			if c.hasPermissionUnCheck() {
-				c.permissionChecking = true
+				c.permissionCheckState.StartProcessing()
 				msgs := c.msgQueue.sliceWithSize(c.msgQueue.permissionCheckingIndex+1, c.msgQueue.payloadDecryptingIndex+1, 0)
 				if len(msgs) > 0 {
 					c.exec(&ChannelAction{ActionType: ChannelActionPermissionCheck, Messages: msgs})
@@ -177,7 +189,7 @@ func (c *channel) ready() ready {
 
 			// 如果有未存储的消息，则继续存储
 			if c.hasUnstorage() {
-				c.storaging = true
+				c.storageState.StartProcessing()
 				msgs := c.msgQueue.sliceWithSize(c.msgQueue.storagingIndex+1, c.msgQueue.permissionCheckingIndex+1, c.storageMaxSize)
 				if len(msgs) > 0 {
 					c.exec(&ChannelAction{ActionType: ChannelActionStorage, Messages: msgs})
@@ -188,7 +200,7 @@ func (c *channel) ready() ready {
 
 			// 如果有未发送回执的消息
 			if c.hasSendack() {
-				c.sendacking = true
+				c.sendackState.StartProcessing()
 				// TODO: 这里有个问题，如果投递消息完成后，消息已经被删除了，可能会导致ack发送失败，因为没了消息，虽然概率低，但是还是有可能的
 				msgs := c.msgQueue.sliceWithSize(c.msgQueue.sendackingIndex+1, c.msgQueue.storagingIndex+1, 0)
 				if len(msgs) > 0 {
@@ -198,7 +210,7 @@ func (c *channel) ready() ready {
 
 			// 投递消息
 			if c.hasUnDeliver() {
-				c.delivering = true
+				c.deliveryState.StartProcessing()
 				msgs := c.msgQueue.sliceWithSize(c.msgQueue.deliveringIndex+1, c.msgQueue.storagingIndex+1, c.deliverMaxSize)
 				if len(msgs) > 0 {
 					c.exec(&ChannelAction{ActionType: ChannelActionDeliver, Messages: msgs})
@@ -217,7 +229,7 @@ func (c *channel) ready() ready {
 		} else if c.role == channelRoleProxy {
 			// 转发消息
 			if c.hasUnforward() {
-				c.forwarding = true
+				c.forwardState.StartProcessing()
 				msgs := c.msgQueue.sliceWithSize(c.msgQueue.forwardingIndex+1, c.msgQueue.payloadDecryptingIndex+1, c.deliverMaxSize)
 				if len(msgs) > 0 {
 					c.exec(&ChannelAction{ActionType: ChannelActionForward, LeaderId: c.leaderId, Messages: msgs})
@@ -244,7 +256,7 @@ func (c *channel) ready() ready {
 }
 
 func (c *channel) hasPayloadUnDecrypt() bool {
-	if c.payloadDecrypting {
+	if c.payloadDecryptState.IsProcessing() {
 		return false
 	}
 
@@ -253,7 +265,7 @@ func (c *channel) hasPayloadUnDecrypt() bool {
 
 // 有未权限检查的消息
 func (c *channel) hasPermissionUnCheck() bool {
-	if c.permissionChecking {
+	if c.permissionCheckState.IsProcessing() {
 		return false
 	}
 
@@ -262,7 +274,7 @@ func (c *channel) hasPermissionUnCheck() bool {
 
 // 有未存储的消息
 func (c *channel) hasUnstorage() bool {
-	if c.storaging {
+	if c.storageState.IsProcessing() {
 		return false
 	}
 
@@ -271,7 +283,7 @@ func (c *channel) hasUnstorage() bool {
 
 // 有未发送回执的消息
 func (c *channel) hasSendack() bool {
-	if c.sendacking {
+	if c.sendackState.IsProcessing() {
 		return false
 	}
 
@@ -280,7 +292,7 @@ func (c *channel) hasSendack() bool {
 
 // 有未投递的消息
 func (c *channel) hasUnDeliver() bool {
-	if c.delivering {
+	if c.deliveryState.IsProcessing() {
 		return false
 	}
 
@@ -289,27 +301,26 @@ func (c *channel) hasUnDeliver() bool {
 
 // 有未转发的消息
 func (c *channel) hasUnforward() bool {
-	if c.forwarding { // 在转发中
+	if c.forwardState.IsProcessing() { // 在转发中
 		return false
 	}
 
 	return c.msgQueue.forwardingIndex < c.msgQueue.payloadDecryptingIndex
 }
 
-// 是否已初始化
-func (c *channel) isInitialized() bool {
+// 是否未初始化
+func (c *channel) isUninitialized() bool {
 
-	return c.status == channelStatusInitialized
+	return c.status == channelStatusUninitialized
 }
 
 func (c *channel) tick() {
-	c.storageTick++
-	c.initTick++
+	// c.storageTick++
 	c.forwardTick++
-	c.deliveringTick++
-	c.permissionCheckingTick++
-	c.payloadDecryptingTick++
-	c.sendackingTick++
+	// c.deliveringTick++
+	// c.permissionCheckingTick++
+	// c.payloadDecryptingTick++
+	// c.sendackingTick++
 
 	c.idleTick++
 	if c.idleTick >= c.opts.Reactor.Channel.DeadlineTick {
@@ -317,30 +328,13 @@ func (c *channel) tick() {
 		c.exec(&ChannelAction{ActionType: ChannelActionClose})
 	}
 
-	if c.payloadDecrypting && c.payloadDecryptingTick > c.opts.Reactor.Channel.ProcessIntervalTick {
-		c.payloadDecrypting = false
-		c.payloadDecryptingTick = 0
-	}
-	if c.permissionChecking && c.permissionCheckingTick > c.opts.Reactor.Channel.ProcessIntervalTick {
-		c.permissionChecking = false
-		c.permissionCheckingTick = 0
-	}
-	// if c.storaging && c.storageTick > c.opts.Reactor.Channel.ProcessIntervalTick {
-	// 	c.storaging = false
-	// 	c.storageTick = 0
-	// }
-	if c.sendacking && c.sendackingTick > c.opts.Reactor.Channel.ProcessIntervalTick {
-		c.sendacking = false
-		c.sendackingTick = 0
-	}
-	if c.delivering && c.deliveringTick > c.opts.Reactor.Channel.ProcessIntervalTick {
-		c.delivering = false
-		c.deliveringTick = 0
-	}
-	if c.forwarding && c.forwardTick > c.opts.Reactor.Channel.ProcessIntervalTick {
-		c.forwarding = false
-		c.forwardTick = 0
-	}
+	c.initState.Tick()
+	c.payloadDecryptState.Tick()
+	c.permissionCheckState.Tick()
+	c.storageState.Tick()
+	c.sendackState.Tick()
+	c.deliveryState.Tick()
+	c.forwardState.Tick()
 
 	if c.tickFnc != nil {
 		c.tickFnc()
@@ -364,7 +358,7 @@ func (c *channel) tickProxy() {
 
 }
 
-func (c *channel) proposeSend(messageId int64, fromUid string, fromDeviceId string, fromConnId int64, fromNodeId uint64, isEncrypt bool, sendPacket *wkproto.SendPacket) error {
+func (c *channel) proposeSend(messageId int64, fromUid string, fromDeviceId string, fromConnId int64, fromNodeId uint64, isEncrypt bool, sendPacket *wkproto.SendPacket, wait bool) error {
 
 	message := ReactorChannelMessage{
 		FromConnId:   fromConnId,
@@ -377,11 +371,26 @@ func (c *channel) proposeSend(messageId int64, fromUid string, fromDeviceId stri
 		ReasonCode:   wkproto.ReasonSuccess, // 初始状态为成功
 	}
 
-	c.sub.step(c, &ChannelAction{
+	messages := make([]ReactorChannelMessage, 1)
+	messages[0] = message
+
+	action := &ChannelAction{
 		UniqueNo:   c.uniqueNo,
 		ActionType: ChannelActionSend,
-		Messages:   []ReactorChannelMessage{message},
-	})
+		Messages:   messages,
+	}
+	if wait {
+		err := c.sub.stepWait(c, action)
+		if err != nil {
+			return err
+		}
+	} else {
+		c.sub.step(c, &ChannelAction{
+			UniqueNo:   c.uniqueNo,
+			ActionType: ChannelActionSend,
+			Messages:   messages,
+		})
+	}
 
 	return nil
 }
@@ -392,7 +401,7 @@ func (c *channel) becomeLeader() {
 	c.role = channelRoleLeader
 	c.stepFnc = c.stepLeader
 	c.tickFnc = c.tickLeader
-	c.Info("become logic leader")
+	c.Debug("become logic leader")
 
 }
 
@@ -402,7 +411,7 @@ func (c *channel) becomeProxy(leaderId uint64) {
 	c.leaderId = leaderId
 	c.stepFnc = c.stepProxy
 	c.tickFnc = c.tickProxy
-	c.Info("become logic proxy", zap.Uint64("leaderId", c.leaderId))
+	c.Debug("become logic proxy", zap.Uint64("leaderId", c.leaderId))
 }
 
 func (c *channel) resetIndex() {
@@ -414,22 +423,22 @@ func (c *channel) resetIndex() {
 		c.receiverTagKey.Store("")
 	}
 
-	c.payloadDecrypting = false
-	c.permissionChecking = false
-	c.storaging = false
-	c.sendacking = false
-	c.delivering = false
-	c.forwarding = false
+	c.initState.Reset()
+	c.payloadDecryptState.Reset()
+	c.permissionCheckState.Reset()
+	c.storageState.Reset()
+	c.sendackState.Reset()
+	c.deliveryState.Reset()
+	c.forwardState.Reset()
 
 	c.idleTick = 0
 
-	c.initTick = 0
-	c.storageTick = 0
-	c.forwardTick = 0
-	c.deliveringTick = 0
-	c.permissionCheckingTick = 0
-	c.payloadDecryptingTick = 0
-	c.sendackingTick = 0
+	// c.storageTick = 0
+	// c.forwardTick = 0
+	// c.deliveringTick = 0
+	// c.permissionCheckingTick = 0
+	// c.payloadDecryptingTick = 0
+	// c.sendackingTick = 0
 
 }
 
@@ -461,24 +470,26 @@ func (c *channel) makeReceiverTag() (*tag, error) {
 
 	c.Debug("makeReceiverTag", zap.String("channelId", c.channelId), zap.Uint8("channelType", c.channelType))
 
-	var subscribers []string
+	var (
+		err         error
+		subscribers []string
+	)
 
 	// 根据频道类型获取订阅者列表
 	if c.channelType == wkproto.ChannelTypePerson {
 		if c.r.s.opts.IsFakeChannel(c.channelId) { // 处理假个人频道
+			orgFakeChannelId := c.channelId
 			if c.r.s.opts.IsCmdChannel(c.channelId) {
 				// 处理命令频道
-				orginChannelId := c.r.opts.CmdChannelConvertOrginalChannel(c.channelId)
-				personSubscribers := strings.Split(orginChannelId, "@")
-				for _, personSubscriber := range personSubscribers {
-					if personSubscriber == c.r.opts.SystemUID { // 忽略系统账号
-						continue
-					}
-					subscribers = append(subscribers, personSubscriber)
-				}
-			} else {
-				// 处理普通假个人频道
-				subscribers = strings.Split(c.channelId, "@")
+				orgFakeChannelId = c.r.opts.CmdChannelConvertOrginalChannel(c.channelId)
+			}
+			// 处理普通假个人频道
+			u1, u2 := GetFromUIDAndToUIDWith(orgFakeChannelId)
+			if u1 != c.r.opts.SystemUID {
+				subscribers = append(subscribers, u1)
+			}
+			if u2 != c.r.opts.SystemUID {
+				subscribers = append(subscribers, u2)
 			}
 		}
 	} else if c.channelType == wkproto.ChannelTypeTemp { // 临时频道
@@ -486,21 +497,20 @@ func (c *channel) makeReceiverTag() (*tag, error) {
 	} else {
 
 		// 处理非个人频道
-		realChannelId := c.channelId
+		fakeChannelId := c.channelId
 		if c.r.s.opts.IsCmdChannel(c.channelId) {
-			realChannelId = c.r.opts.CmdChannelConvertOrginalChannel(c.channelId)
+			fakeChannelId = c.r.opts.CmdChannelConvertOrginalChannel(c.channelId) // 将cmd频道id还原成对应的频道id
 		}
-		members, err := c.r.s.store.GetSubscribers(realChannelId, c.channelType)
+
+		// 请求频道的订阅者
+		subscribers, err = c.requestSubscribers(fakeChannelId, c.channelType)
 		if err != nil {
 			return nil, err
-		}
-		for _, member := range members {
-			subscribers = append(subscribers, member.Uid)
 		}
 
 		// 如果是客服频道，获取访客的uid作为订阅者
 		if c.channelType == wkproto.ChannelTypeCustomerService {
-			visitorID, _ := c.opts.GetCustomerServiceVisitorUID(c.channelId) // 获取访客ID
+			visitorID, _ := c.opts.GetCustomerServiceVisitorUID(fakeChannelId) // 获取访客ID
 			if strings.TrimSpace(visitorID) != "" {
 				subscribers = append(subscribers, visitorID)
 			}
@@ -538,10 +548,63 @@ func (c *channel) makeReceiverTag() (*tag, error) {
 
 	// 创建新的接收者标签
 	receiverTagKey := wkutil.GenUUID()
-	newTag := c.r.s.tagManager.addOrUpdateReceiverTag(receiverTagKey, nodeUserList)
+	newTag := c.r.s.tagManager.addOrUpdateReceiverTag(receiverTagKey, nodeUserList, c.channelId, c.channelType)
 	c.receiverTagKey.Store(receiverTagKey)
 
 	return newTag, nil
+}
+
+// requestSubscribers 请求订阅者
+func (c *channel) requestSubscribers(channelId string, channelType uint8) ([]string, error) {
+
+	leaderNode, err := c.r.s.cluster.LeaderOfChannelForRead(channelId, channelType)
+	if err != nil {
+		return nil, err
+	}
+	if leaderNode == nil {
+		return nil, errors.New("requestSubscribers: channel leader is nil")
+	}
+
+	if leaderNode.Id == c.r.s.opts.Cluster.NodeId {
+		// 如果是本节点，则直接获取订阅者
+		members, err := c.r.s.store.GetSubscribers(channelId, channelType)
+		if err != nil {
+			return nil, err
+		}
+		var subscribers []string
+		for _, member := range members {
+			subscribers = append(subscribers, member.Uid)
+		}
+		return subscribers, nil
+
+	}
+
+	timeoutCtx, cancel := context.WithTimeout(c.r.s.ctx, time.Second*5)
+	defer cancel()
+
+	req := &subscriberGetReq{
+		ChannelId:   channelId,
+		ChannelType: channelType,
+	}
+	data := req.Marshal()
+
+	resp, err := c.r.s.cluster.RequestWithContext(timeoutCtx, leaderNode.Id, "/wk/getSubscribers", data)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.Status != proto.StatusOK {
+		c.Error("requestSubscribers: response status code is not ok", zap.Int("status", int(resp.Status)), zap.String("body", string(resp.Body)))
+		return nil, fmt.Errorf("requestSubscribers: response status code is %d", resp.Status)
+	}
+
+	subResp := subscriberGetResp{}
+	err = subResp.Unmarshal(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	return subResp, nil
+
 }
 
 func (c *channel) setTmpSubscribers(subscribers []string) {

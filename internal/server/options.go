@@ -60,6 +60,7 @@ type Options struct {
 	WSAddr      string       // websocket 监听地址 例如：ws://0.0.0.0:5200
 	WSSAddr     string       // wss 监听地址 例如：wss://0.0.0.0:5210
 	WSTLSConfig *tls.Config
+	Stress      bool     // 是否开启压力测试
 	WSSConfig   struct { // wss的证书配置
 		CertFile string // 证书文件
 		KeyFile  string // 私钥文件
@@ -86,7 +87,7 @@ type Options struct {
 		On   bool   // 是否开启demo
 		Addr string // demo服务地址 默认为 0.0.0.0:5172
 	}
-	External struct {
+	External struct { // 外网配置
 		IP                string // 外网IP
 		TCPAddr           string // 节点的TCP地址 对外公开，APP端长连接通讯  格式： ip:port
 		WSAddr            string //  节点的wsAdd地址 对外公开 WEB端长连接通讯 格式： ws://ip:port
@@ -94,6 +95,9 @@ type Options struct {
 		ManagerAddr       string // 对外访问的管理地址
 		APIUrl            string // 对外访问的API基地址 格式: http://ip:port
 		AutoGetExternalIP bool   // 是否自动获取外网IP
+	}
+	Intranet struct { // 内网配置
+		TCPAddr string // 内网连接的tcp长连接地址
 	}
 	Channel struct { // 频道配置
 		CacheCount                int    // 频道缓存数量
@@ -111,6 +115,7 @@ type Options struct {
 		MsgNotifyEventPushInterval  time.Duration // 消息通知事件推送间隔，默认500毫秒发起一次推送
 		MsgNotifyEventCountPerPush  int           // 每次webhook消息通知事件推送消息数量限制 默认一次请求最多推送100条
 		MsgNotifyEventRetryMaxCount int           // 消息通知事件消息推送失败最大重试次数 默认为5次，超过将丢弃
+		FocusEvents                 []string      // 关注的通知事件,如果为空表示关注所有事件
 	}
 	Datasource struct { // 数据源配置，不填写则使用自身数据存储逻辑，如果填写则使用第三方数据源，数据格式请查看文档
 		Addr          string // 数据源地址
@@ -154,10 +159,6 @@ type Options struct {
 	WhitelistOffOfPerson bool // 是否关闭个人白名单验证
 	DeliveryMsgPoolSize  int  // 投递消息协程池大小，此池的协程主要用来将消息投递给在线用户 默认大小为 10240
 
-	Process struct {
-		AuthPoolSize int // 鉴权协程池大小
-	}
-
 	MessageRetry struct {
 		Interval     time.Duration // 消息重试间隔，如果消息发送后在此间隔内没有收到ack，将会在此间隔后重新发送
 		MaxCount     int           // 消息最大重试次数
@@ -199,6 +200,7 @@ type Options struct {
 		Channel struct {
 			SubCount             int           // channel reactor sub 的数量
 			ProcessIntervalTick  int           // 处理频道逻辑的间隔tick,如果大于此tick数则重置请求
+			ProcessPoolSize      int           // 处理频道逻辑的协程池大小
 			DeadlineTick         int           // 死亡的tick次数，超过此次数如果没有收到发送消息的请求，则会将此频道移除活跃状态
 			TagCheckIntervalTick int           // tag检查间隔tick
 			TickInterval         time.Duration // tick间隔
@@ -207,8 +209,9 @@ type Options struct {
 		User struct {
 			SubCount                int           // user reactor sub 的数量
 			ProcessIntervalTick     int           // 处理用户逻辑的间隔tick
+			ProcessPoolSize         int           // 处理用户逻辑的协程池大小
 			NodePingTick            int           // 用户节点tick间隔
-			NodePongTimeoutTick     int           // 用户节点pong超时tick,这个值必须要比UserNodePingTick大，一般建议是UserNodePingTick的2倍
+			NodePongTimeoutTick     int           // 用户节点pong超时tick,这个值必须要比User.NodePingTick大，一般建议是User.NodePingTick的2倍
 			CheckLeaderIntervalTick int           // 校验用户leader间隔tick，（隔多久验证一下当前领导是否是正确的领导）
 			TickInterval            time.Duration // tick间隔
 		}
@@ -349,7 +352,7 @@ func NewOptions(op ...Option) *Options {
 			WorkerScanInterval time.Duration
 		}{
 			On:                 true,
-			CacheExpire:        time.Hour * 24 * 1, // 1天过期
+			CacheExpire:        time.Hour * 2,
 			UserMaxCount:       1000,
 			SyncInterval:       time.Minute * 5,
 			SyncOnce:           100,
@@ -369,7 +372,7 @@ func NewOptions(op ...Option) *Options {
 			Interval:     time.Second * 60,
 			ScanInterval: time.Second * 30,
 			MaxCount:     5,
-			WorkerCount:  24,
+			WorkerCount:  128,
 		},
 		Webhook: struct {
 			HTTPAddr                    string
@@ -377,6 +380,7 @@ func NewOptions(op ...Option) *Options {
 			MsgNotifyEventPushInterval  time.Duration
 			MsgNotifyEventCountPerPush  int
 			MsgNotifyEventRetryMaxCount int
+			FocusEvents                 []string
 		}{
 			MsgNotifyEventPushInterval:  time.Millisecond * 500,
 			MsgNotifyEventCountPerPush:  100,
@@ -426,7 +430,7 @@ func NewOptions(op ...Option) *Options {
 			TickInterval:           time.Millisecond * 150,
 			HeartbeatIntervalTick:  1,
 			ElectionIntervalTick:   10,
-			ChannelReactorSubCount: 64,
+			ChannelReactorSubCount: 128,
 			SlotReactorSubCount:    64,
 			PongMaxTick:            30,
 		},
@@ -443,6 +447,7 @@ func NewOptions(op ...Option) *Options {
 			Channel struct {
 				SubCount             int
 				ProcessIntervalTick  int
+				ProcessPoolSize      int
 				DeadlineTick         int
 				TagCheckIntervalTick int
 				TickInterval         time.Duration
@@ -450,6 +455,7 @@ func NewOptions(op ...Option) *Options {
 			User struct {
 				SubCount                int
 				ProcessIntervalTick     int
+				ProcessPoolSize         int
 				NodePingTick            int
 				NodePongTimeoutTick     int
 				CheckLeaderIntervalTick int
@@ -466,19 +472,22 @@ func NewOptions(op ...Option) *Options {
 			Channel: struct {
 				SubCount             int
 				ProcessIntervalTick  int
+				ProcessPoolSize      int
 				DeadlineTick         int
 				TagCheckIntervalTick int
 				TickInterval         time.Duration
 			}{
-				SubCount:             64,
+				SubCount:             128,
 				ProcessIntervalTick:  50,
+				ProcessPoolSize:      4096,
 				DeadlineTick:         1200,
-				TagCheckIntervalTick: 10,
+				TagCheckIntervalTick: 20,
 				TickInterval:         time.Millisecond * 200,
 			},
 			User: struct {
 				SubCount                int
 				ProcessIntervalTick     int
+				ProcessPoolSize         int
 				NodePingTick            int
 				NodePongTimeoutTick     int
 				CheckLeaderIntervalTick int
@@ -486,9 +495,10 @@ func NewOptions(op ...Option) *Options {
 			}{
 				SubCount:                64,
 				ProcessIntervalTick:     50,
-				NodePingTick:            100,
+				ProcessPoolSize:         4096,
+				NodePingTick:            1000,
 				NodePongTimeoutTick:     100 * 5,
-				CheckLeaderIntervalTick: 10,
+				CheckLeaderIntervalTick: 20,
 				TickInterval:            time.Millisecond * 200,
 			},
 			Stream: struct {
@@ -502,11 +512,6 @@ func NewOptions(op ...Option) *Options {
 				ProcessIntervalTick: 50,
 				IdleTimeoutTick:     10,
 			},
-		},
-		Process: struct {
-			AuthPoolSize int
-		}{
-			AuthPoolSize: 100,
 		},
 		Deliver: struct {
 			DeliverrCount         int
@@ -572,6 +577,7 @@ func (o *Options) ConfigureWithViper(vp *viper.Viper) {
 	} else {
 		o.Mode = Mode(modeStr)
 	}
+	o.Stress = o.getBool("stress", o.Stress)
 
 	o.GinMode = o.getString("ginMode", o.GinMode)
 
@@ -592,6 +598,8 @@ func (o *Options) ConfigureWithViper(vp *viper.Viper) {
 	o.External.ManagerAddr = o.getString("external.managerAddr", o.External.ManagerAddr)
 	o.External.APIUrl = o.getString("external.apiUrl", o.External.APIUrl)
 	o.External.AutoGetExternalIP = o.getBool("external.autoGetExternalIP", o.External.AutoGetExternalIP)
+
+	o.Intranet.TCPAddr = o.getString("intranet.tcpAddr", o.Intranet.TCPAddr)
 
 	o.Manager.On = o.getBool("manager.on", o.Manager.On)
 	o.Manager.Addr = o.getString("manager.addr", o.Manager.Addr)
@@ -618,6 +626,10 @@ func (o *Options) ConfigureWithViper(vp *viper.Viper) {
 
 	o.TokenAuthOn = o.getBool("tokenAuthOn", o.TokenAuthOn)
 
+	if o.Stress { // 开启了压测模式不能开启认证
+		o.TokenAuthOn = false
+	}
+
 	o.UnitTest = o.vp.GetBool("unitTest")
 
 	o.Webhook.GRPCAddr = o.getString("webhook.grpcAddr", o.Webhook.GRPCAddr)
@@ -625,6 +637,7 @@ func (o *Options) ConfigureWithViper(vp *viper.Viper) {
 	o.Webhook.MsgNotifyEventRetryMaxCount = o.getInt("webhook.msgNotifyEventRetryMaxCount", o.Webhook.MsgNotifyEventRetryMaxCount)
 	o.Webhook.MsgNotifyEventCountPerPush = o.getInt("webhook.msgNotifyEventCountPerPush", o.Webhook.MsgNotifyEventCountPerPush)
 	o.Webhook.MsgNotifyEventPushInterval = o.getDuration("webhook.msgNotifyEventPushInterval", o.Webhook.MsgNotifyEventPushInterval)
+	o.Webhook.FocusEvents = o.getStringSlice("webhook.focusEvents")
 
 	o.EventPoolSize = o.getInt("eventPoolSize", o.EventPoolSize)
 	o.DeliveryMsgPoolSize = o.getInt("deliveryMsgPoolSize", o.DeliveryMsgPoolSize)
@@ -783,6 +796,7 @@ func (o *Options) ConfigureWithViper(vp *viper.Viper) {
 	o.Reactor.Channel.SubCount = o.getInt("reactor.channel.subCount", o.Reactor.Channel.SubCount)
 	o.Reactor.Channel.DeadlineTick = o.getInt("reactor.channel.deadlineTick", o.Reactor.Channel.DeadlineTick)
 	o.Reactor.Channel.ProcessIntervalTick = o.getInt("reactor.channel.processIntervalTick", o.Reactor.Channel.ProcessIntervalTick)
+	o.Reactor.Channel.ProcessPoolSize = o.getInt("reactor.channel.processPoolSize", o.Reactor.Channel.ProcessPoolSize)
 	o.Reactor.Channel.DeadlineTick = o.getInt("reactor.channel.deadlineTick", o.Reactor.Channel.DeadlineTick)
 	o.Reactor.Channel.TagCheckIntervalTick = o.getInt("reactor.channel.tagCheckIntervalTick", o.Reactor.Channel.TagCheckIntervalTick)
 	o.Reactor.Channel.TickInterval = o.getDuration("reactor.channel.tickInterval", o.Reactor.Channel.TickInterval)
@@ -790,6 +804,7 @@ func (o *Options) ConfigureWithViper(vp *viper.Viper) {
 	// user
 	o.Reactor.User.SubCount = o.getInt("reactor.user.subCount", o.Reactor.User.SubCount)
 	o.Reactor.User.ProcessIntervalTick = o.getInt("reactor.user.processIntervalTick", o.Reactor.User.ProcessIntervalTick)
+	o.Reactor.User.ProcessPoolSize = o.getInt("reactor.user.processPoolSize", o.Reactor.User.ProcessPoolSize)
 	o.Reactor.User.NodePingTick = o.getInt("reactor.user.nodePingTick", o.Reactor.User.NodePingTick)
 	o.Reactor.User.NodePongTimeoutTick = o.getInt("reactor.user.nodePongTimeoutTick", o.Reactor.User.NodePongTimeoutTick)
 	o.Reactor.User.CheckLeaderIntervalTick = o.getInt("reactor.checkUserLeaderIntervalTick", o.Reactor.User.CheckLeaderIntervalTick)
@@ -812,6 +827,7 @@ func (o *Options) ConfigureWithViper(vp *viper.Viper) {
 
 	// =================== other ===================
 	deadlock.Opts.Disable = !o.DeadlockCheck
+	// deadlock.Opts.Disable = false
 	o.PprofOn = o.getBool("pprofOn", o.PprofOn)
 	o.OldV1Api = o.getString("oldV1Api", o.OldV1Api)
 	o.MigrateStartStep = MigrateStep(o.getString("migrateStartStep", string(o.MigrateStartStep)))
@@ -1029,6 +1045,16 @@ func (o *Options) IsTmpChannel(channelID string) bool {
 	return strings.HasSuffix(channelID, o.TmpChannel.Suffix)
 }
 
+// IsSystemChannel 是否是系统设备
+func (o *Options) IsSystemDevice(deviceId string) bool {
+	return deviceId == o.SystemDeviceId
+}
+
+// IsSystemUid 是否是系统uid
+func (o *Options) IsSystemUid(uid string) bool {
+	return uid == o.SystemUID
+}
+
 func (o *Options) ConfigFileUsed() string {
 	if o.vp == nil {
 		return ""
@@ -1105,8 +1131,27 @@ func (o *Options) getDuration(key string, defaultValue time.Duration) time.Durat
 	return v
 }
 
+// 判断Webhook事件是否关注
+func (o *Options) isEventFocused(event string) bool {
+	if len(o.Webhook.FocusEvents) == 0 {
+		return true
+	}
+
+	for _, v := range o.Webhook.FocusEvents {
+		if v == event {
+			return true
+		}
+	}
+	return false
+}
+
 // WebhookOn WebhookOn
-func (o *Options) WebhookOn() bool {
+func (o *Options) WebhookOn(event string) bool {
+    if !o.isEventFocused(event) {
+		// webhook 非关注，不进行下面的逻辑
+		return false
+	}
+
 	return strings.TrimSpace(o.Webhook.HTTPAddr) != "" || o.WebhookGRPCOn()
 }
 
@@ -1191,6 +1236,11 @@ func GetExternalIP() (string, error) {
 		}
 	}
 	return externalIP, nil
+}
+
+// 是本节点
+func (o *Options) IsLocalNode(nodeId uint64) bool {
+	return o.Cluster.NodeId == nodeId
 }
 
 type Node struct {
@@ -1628,6 +1678,12 @@ func WithClusterPongMaxTick(pongMaxTick int) Option {
 	}
 }
 
+func WithClusterAPIURL(apiUrl string) Option {
+	return func(opts *Options) {
+		opts.Cluster.APIUrl = apiUrl
+	}
+}
+
 func WithTraceServiceName(serviceName string) Option {
 	return func(opts *Options) {
 		opts.Trace.ServiceName = serviceName
@@ -1667,12 +1723,6 @@ func WithReactorUserNodePingTick(userNodePingTick int) Option {
 func WithReactorUserNodePongTimeoutTick(userNodePongTimeoutTick int) Option {
 	return func(opts *Options) {
 		opts.Reactor.User.NodePongTimeoutTick = userNodePongTimeoutTick
-	}
-}
-
-func WithProcessAuthPoolSize(authPoolSize int) Option {
-	return func(opts *Options) {
-		opts.Process.AuthPoolSize = authPoolSize
 	}
 }
 

@@ -12,3 +12,14 @@ func MD5(str string) string {
 	passwordmdsBys := h.Sum(nil)
 	return hex.EncodeToString(passwordmdsBys)
 }
+
+func MD5Bytes(data []byte) string {
+	h := md5.New()
+	h.Write(data)
+
+	// 获取 MD5 的结果
+	sum := h.Sum(nil)
+
+	return hex.EncodeToString(sum)
+
+}

@@ -1,7 +1,6 @@
 package cluster
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -47,13 +46,6 @@ var (
 	ErrSlotLeaderNotFound           = errors.New("slot leader not found")
 	ErrEmptyRequest                 = errors.New("empty request")
 	ErrChannelClusterConfigNotFound = errors.New("channel cluster config not found")
-)
-
-const (
-	MsgUnknown          = iota
-	MsgSlotMsg          // 槽消息
-	MsgChannelMsg       // 频道消息
-	MsgClusterConfigMsg // 集群配置消息
 )
 
 // // 频道分布式配置
@@ -325,6 +317,7 @@ func (c *SyncInfo) Unmarshal(data []byte) error {
 type ChannelClusterConfigReq struct {
 	ChannelId   string `json:"channel_id"`   // 频道id
 	ChannelType uint8  `json:"channel_type"` // 频道类型
+	From        uint64 `json:"from"`         // 请求节点
 }
 
 func (c *ChannelClusterConfigReq) Marshal() ([]byte, error) {
@@ -332,6 +325,7 @@ func (c *ChannelClusterConfigReq) Marshal() ([]byte, error) {
 	defer enc.End()
 	enc.WriteString(c.ChannelId)
 	enc.WriteUint8(c.ChannelType)
+	enc.WriteUint64(c.From)
 	return enc.Bytes(), nil
 }
 
@@ -342,6 +336,9 @@ func (c *ChannelClusterConfigReq) Unmarshal(data []byte) error {
 		return err
 	}
 	if c.ChannelType, err = dec.Uint8(); err != nil {
+		return err
+	}
+	if c.From, err = dec.Uint64(); err != nil {
 		return err
 	}
 	return nil
@@ -818,7 +815,7 @@ type ChannelClusterStorage interface {
 
 	GetAll(offsetId uint64, limit int) ([]wkdb.ChannelClusterConfig, error)
 	// 提案配置
-	Propose(ctx context.Context, cfg wkdb.ChannelClusterConfig) error
+	Propose(cfg wkdb.ChannelClusterConfig) error
 	// // 获取所有槽位的频道分布式配置
 	// GetWithAllSlot() ([]*wkstore.ChannelClusterConfig, error)
 }
@@ -1033,6 +1030,7 @@ type messageResp struct {
 	FromUid         string `json:"from_uid"`         // 发送者UID
 	Payload         []byte `json:"payload"`          // 消息内容
 	Expire          uint32 `json:"expire"`           // 消息过期时间 0 表示永不过期
+	Term            uint64 `json:"term"`             // 消息任期
 }
 
 func newMessageResp(m wkdb.Message) *messageResp {
@@ -1051,6 +1049,7 @@ func newMessageResp(m wkdb.Message) *messageResp {
 		FromUid:         m.FromUID,
 		Payload:         m.Payload,
 		Expire:          m.Expire,
+		Term:            m.Term,
 	}
 }
 
@@ -1762,6 +1761,7 @@ type channelReplicaResp struct {
 	Running     int    `json:"running"`       // 是否运行中
 	LastMsgSeq  uint64 `json:"last_msg_seq"`  // 最新消息序号
 	LastMsgTime uint64 `json:"last_msg_time"` // 最新消息时间
+	Term        uint32 `json:"term"`          // 任期
 }
 
 type channelReplicaDetailResp struct {
@@ -1769,4 +1769,81 @@ type channelReplicaDetailResp struct {
 	Role              int    `json:"role"`                 // 角色
 	RoleFormat        string `json:"role_format"`          // 角色格式化
 	LastMsgTimeFormat string `json:"last_msg_time_format"` // 最新消息时间格式化
+
+}
+
+type ping struct {
+	no        string // ping唯一编号
+	from      uint64 // 发起节点
+	to        uint64
+	startMill int64 // 开始时间
+	costMill  int64 // 耗时毫秒
+	waitC     chan *pong
+	err       error // 错误信息
+}
+
+func (p *ping) marshal() []byte {
+	enc := wkproto.NewEncoder()
+	defer enc.End()
+	enc.WriteString(p.no)
+	enc.WriteUint64(p.from)
+	enc.WriteInt64(p.startMill)
+	return enc.Bytes()
+}
+
+func unmarshalPing(data []byte) (*ping, error) {
+	dec := wkproto.NewDecoder(data)
+	no, err := dec.String()
+	if err != nil {
+		return nil, err
+	}
+	from, err := dec.Uint64()
+	if err != nil {
+		return nil, err
+	}
+	startMill, err := dec.Int64()
+	if err != nil {
+		return nil, err
+	}
+	return &ping{
+		no:        no,
+		from:      from,
+		startMill: startMill,
+	}, nil
+}
+
+type pong struct {
+	no        string // ping唯一编号
+	from      uint64 // 发起节点
+	startMill int64  // 开始时间
+}
+
+func (p *pong) marshal() []byte {
+	enc := wkproto.NewEncoder()
+	defer enc.End()
+	enc.WriteString(p.no)
+	enc.WriteUint64(p.from)
+	enc.WriteInt64(p.startMill)
+	return enc.Bytes()
+}
+
+func unmarshalPong(data []byte) (*pong, error) {
+	dec := wkproto.NewDecoder(data)
+	no, err := dec.String()
+	if err != nil {
+		return nil, err
+	}
+	from, err := dec.Uint64()
+	if err != nil {
+		return nil, err
+	}
+	startMill, err := dec.Int64()
+	if err != nil {
+		return nil, err
+	}
+	return &pong{
+		no:        no,
+		from:      from,
+		startMill: startMill,
+	}, nil
 }

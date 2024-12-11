@@ -276,7 +276,6 @@ type channelStatus int
 
 const (
 	channelStatusUninitialized channelStatus = iota // 未初始化
-	channelStatusInitializing                       // 初始化中
 	channelStatusInitialized                        // 初始化完成
 )
 
@@ -285,7 +284,6 @@ type userStatus int
 
 const (
 	userStatusUninitialized userStatus = iota // 未初始化
-	userStatusInitializing                    // 初始化中
 	userStatusInitialized                     // 初始化完成
 )
 
@@ -296,6 +294,19 @@ const (
 	userRoleLeader // 领导 （领导负责用户数据的真实处理）
 	userRoleProxy  // 代理 （代理不处理逻辑，只将数据转发给领导）
 )
+
+func (u userRole) String() string {
+	switch u {
+	case userRoleUnknow:
+		return "unknow"
+	case userRoleLeader:
+		return "leader"
+	case userRoleProxy:
+		return "proxy"
+	default:
+		return fmt.Sprintf("%d", u)
+	}
+}
 
 func handlerIMError(resp *rest.Response) error {
 	if resp.StatusCode != http.StatusOK {

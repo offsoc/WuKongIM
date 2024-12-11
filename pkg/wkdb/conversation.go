@@ -1,6 +1,7 @@
 package wkdb
 
 import (
+	"fmt"
 	"math"
 	"time"
 
@@ -9,8 +10,76 @@ import (
 	"go.uber.org/zap"
 )
 
-func (wk *wukongDB) AddOrUpdateConversations(uid string, conversations []Conversation) error {
+func (wk *wukongDB) AddOrUpdateConversations(conversations []Conversation) error {
+	wk.metrics.AddOrUpdateConversationsAdd(1)
 
+	if len(conversations) == 0 {
+		return nil
+	}
+
+	userBatchMap := make(map[uint32]*Batch)
+
+	for _, conversation := range conversations {
+		shardId := wk.shardId(conversation.Uid)
+		batch := userBatchMap[shardId]
+		if batch == nil {
+			batch = wk.shardBatchDBById(shardId).NewBatch()
+			userBatchMap[shardId] = batch
+		}
+
+		oldConversation, err := wk.GetConversation(conversation.Uid, conversation.ChannelId, conversation.ChannelType)
+		if err != nil && err != ErrNotFound {
+			return err
+		}
+		exist := !IsEmptyConversation(oldConversation)
+
+		// 如果会话存在 则删除旧的索引
+		if exist {
+			oldConversation.CreatedAt = nil
+			err = wk.deleteConversationIndex(oldConversation, batch)
+			if err != nil {
+				return err
+			}
+			conversation.Id = oldConversation.Id
+		}
+
+		if exist {
+			conversation.CreatedAt = nil // 更新时不更新创建时间
+		}
+
+		if err := wk.writeConversation(conversation, batch); err != nil {
+			return err
+		}
+	}
+
+	err := wk.setConversationLocalUserRelation(conversations, false)
+	if err != nil {
+		return err
+	}
+
+	batchs := make([]*Batch, 0, len(userBatchMap))
+	for _, batch := range userBatchMap {
+		batchs = append(batchs, batch)
+	}
+
+	err = Commits(batchs)
+	if err != nil {
+		wk.Error("commits failed", zap.Error(err))
+		return nil
+	}
+
+	// // 设置最近会话用户关系
+	// err = wk.setConversationLocalUserRelation(conversations)
+	// if err != nil {
+	// 	return err
+	// }
+
+	return nil
+
+}
+
+func (wk *wukongDB) AddOrUpdateConversationsWithUser(uid string, conversations []Conversation) error {
+	wk.metrics.AddOrUpdateConversationsAdd(1)
 	// wk.dblock.conversationLock.lock(uid)
 	// defer wk.dblock.conversationLock.unlock(uid)
 	if wk.opts.EnableCost {
@@ -52,6 +121,11 @@ func (wk *wukongDB) AddOrUpdateConversations(uid string, conversations []Convers
 		}
 	}
 
+	err := wk.setConversationLocalUserRelation(conversations, false)
+	if err != nil {
+		return err
+	}
+
 	// err := wk.IncConversationCount(createCount)
 	// if err != nil {
 	// 	return err
@@ -60,8 +134,32 @@ func (wk *wukongDB) AddOrUpdateConversations(uid string, conversations []Convers
 	return batch.CommitWait()
 }
 
+func (wk *wukongDB) UpdateConversationIfSeqGreaterAsync(uid, channelId string, channelType uint8, readToMsgSeq uint64) error {
+
+	existConversation, err := wk.GetConversation(uid, channelId, channelType)
+	if err != nil {
+		return err
+	}
+	if IsEmptyConversation(existConversation) {
+		return nil
+	}
+
+	if existConversation.ReadToMsgSeq >= readToMsgSeq { // 如果当前readToMsgSeq大于或等于传过来的，则不需要更新
+		return nil
+	}
+
+	w := wk.sharedBatchDB(uid).NewBatch()
+	// readedToMsgSeq
+	var msgSeqBytes = make([]byte, 8)
+	wk.endian.PutUint64(msgSeqBytes, readToMsgSeq)
+	w.Set(key.NewConversationColumnKey(uid, existConversation.Id, key.TableConversation.Column.ReadedToMsgSeq), msgSeqBytes)
+	return w.Commit()
+}
+
 // GetConversations 获取指定用户的最近会话
 func (wk *wukongDB) GetConversations(uid string) ([]Conversation, error) {
+
+	wk.metrics.GetConversationsAdd(1)
 
 	db := wk.shardDB(uid)
 	iter := db.NewIter(&pebble.IterOptions{
@@ -82,6 +180,8 @@ func (wk *wukongDB) GetConversations(uid string) ([]Conversation, error) {
 }
 
 func (wk *wukongDB) GetConversationsByType(uid string, tp ConversationType) ([]Conversation, error) {
+
+	wk.metrics.GetConversationsByTypeAdd(1)
 
 	db := wk.shardDB(uid)
 	iter := db.NewIter(&pebble.IterOptions{
@@ -104,6 +204,9 @@ func (wk *wukongDB) GetConversationsByType(uid string, tp ConversationType) ([]C
 }
 
 func (wk *wukongDB) GetLastConversations(uid string, tp ConversationType, updatedAt uint64, limit int) ([]Conversation, error) {
+
+	wk.metrics.GetLastConversationsAdd(1)
+
 	ids, err := wk.getLastConversationIds(uid, updatedAt, limit)
 	if err != nil {
 		return nil, err
@@ -131,6 +234,27 @@ func (wk *wukongDB) GetLastConversations(uid string, tp ConversationType, update
 	conversations = uniqueConversation(conversations)
 
 	return conversations, nil
+}
+
+func (wk *wukongDB) GetChannelConversationLocalUsers(channelId string, channelType uint8) ([]string, error) {
+
+	db := wk.channelDb(channelId, channelType)
+
+	iter := db.NewIter(&pebble.IterOptions{
+		LowerBound: key.NewConversationLocalUserLowKey(channelId, channelType),
+		UpperBound: key.NewConversationLocalUserHighKey(channelId, channelType),
+	})
+	defer iter.Close()
+
+	var users []string
+	for iter.First(); iter.Valid(); iter.Next() {
+		uid, err := key.ParseConversationLocalUserKey(iter.Key())
+		if err != nil {
+			return nil, err
+		}
+		users = append(users, uid)
+	}
+	return users, nil
 }
 
 func uniqueConversation(conversations []Conversation) []Conversation {
@@ -178,10 +302,16 @@ func (wk *wukongDB) getLastConversationIds(uid string, updatedAt uint64, limit i
 // DeleteConversation 删除最近会话
 func (wk *wukongDB) DeleteConversation(uid string, channelId string, channelType uint8) error {
 
+	wk.metrics.DeleteConversationAdd(1)
+
 	batch := wk.sharedBatchDB(uid).NewBatch()
 
 	err := wk.deleteConversation(uid, channelId, channelType, batch)
 	if err != nil {
+		return err
+	}
+
+	if err := wk.deleteConversationLocalUserRelation(channelId, channelType, uid); err != nil {
 		return err
 	}
 
@@ -191,6 +321,9 @@ func (wk *wukongDB) DeleteConversation(uid string, channelId string, channelType
 
 // DeleteConversations 批量删除最近会话
 func (wk *wukongDB) DeleteConversations(uid string, channels []Channel) error {
+
+	wk.metrics.DeleteConversationsAdd(1)
+
 	batch := wk.sharedBatchDB(uid).NewBatch()
 
 	for _, channel := range channels {
@@ -199,10 +332,19 @@ func (wk *wukongDB) DeleteConversations(uid string, channels []Channel) error {
 			return err
 		}
 	}
+
+	err := wk.deleteConversationLocalUserRelationWithChannels(uid, channels)
+	if err != nil {
+		return err
+	}
+
 	return batch.CommitWait()
 }
 
 func (wk *wukongDB) SearchConversation(req ConversationSearchReq) ([]Conversation, error) {
+
+	wk.metrics.SearchConversationAdd(1)
+
 	if req.Uid != "" {
 		return wk.GetConversations(req.Uid)
 	}
@@ -256,6 +398,8 @@ func (wk *wukongDB) deleteConversation(uid string, channelId string, channelType
 // GetConversation 获取指定用户的指定会话
 func (wk *wukongDB) GetConversation(uid string, channelId string, channelType uint8) (Conversation, error) {
 
+	wk.metrics.GetConversationAdd(1)
+
 	id, err := wk.getConversationByChannel(uid, channelId, channelType)
 	if err != nil {
 		return EmptyConversation, err
@@ -288,6 +432,9 @@ func (wk *wukongDB) GetConversation(uid string, channelId string, channelType ui
 }
 
 func (wk *wukongDB) ExistConversation(uid string, channelId string, channelType uint8) (bool, error) {
+
+	wk.metrics.ExistConversationAdd(1)
+
 	idBytes, closer, err := wk.shardDB(uid).Get(key.NewConversationIndexChannelKey(uid, channelId, channelType))
 	if err != nil {
 		if err == pebble.ErrNotFound {
@@ -415,7 +562,9 @@ func (wk *wukongDB) writeConversation(conversation Conversation, w *Batch) error
 	var msgSeqBytes = make([]byte, 8)
 	wk.endian.PutUint64(msgSeqBytes, conversation.ReadToMsgSeq)
 	w.Set(key.NewConversationColumnKey(uid, id, key.TableConversation.Column.ReadedToMsgSeq), msgSeqBytes)
-
+	if conversation.ChannelId == "a4593c39234a4336a799855bfa6b9455" {
+		fmt.Println("conversation.ReadToMsgSeq----------->", conversation.ReadToMsgSeq)
+	}
 	// createdAt
 	if conversation.CreatedAt != nil {
 		createdAtBytes := make([]byte, 8)
@@ -546,6 +695,53 @@ func (wk *wukongDB) iterateConversation(iter *pebble.Iterator, iterFnc func(conv
 	}
 
 	return nil
+}
+
+// 设置最近会话用户关系
+func (wk *wukongDB) setConversationLocalUserRelation(conversations []Conversation, commitWait bool) error {
+
+	// 按照频道分组
+	batchMap := make(map[string]*Batch)
+	for _, conversation := range conversations {
+		batch := batchMap[conversation.Uid]
+		if batch == nil {
+			batch = wk.channelBatchDb(conversation.ChannelId, conversation.ChannelType).NewBatch()
+			batchMap[conversation.Uid] = batch
+		}
+		batch.Set(key.NewConversationLocalUserKey(conversation.ChannelId, conversation.ChannelType, conversation.Uid), nil)
+	}
+
+	batchs := make([]*Batch, 0, len(batchMap))
+	for _, batch := range batchMap {
+		batchs = append(batchs, batch)
+	}
+
+	if commitWait {
+		return Commits(batchs)
+	} else {
+		for _, batch := range batchs {
+			err := batch.Commit()
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (wk *wukongDB) deleteConversationLocalUserRelation(channelId string, channelType uint8, uid string) error {
+	batch := wk.channelBatchDb(channelId, channelType).NewBatch()
+	batch.Delete(key.NewConversationLocalUserKey(channelId, channelType, uid))
+
+	return batch.CommitWait()
+}
+
+func (wk *wukongDB) deleteConversationLocalUserRelationWithChannels(uid string, channels []Channel) error {
+	batch := wk.sharedBatchDB(uid).NewBatch()
+	for _, channel := range channels {
+		batch.Delete(key.NewConversationLocalUserKey(channel.ChannelId, channel.ChannelType, uid))
+	}
+	return batch.CommitWait()
 }
 
 // func (wk *wukongDB) parseConversations(iter *pebble.Iterator, limit int) ([]Conversation, error) {

@@ -1,5 +1,7 @@
 package wkdb
 
+import "github.com/WuKongIM/WuKongIM/pkg/cluster/reactor"
+
 type DB interface {
 	Open() error
 	Close() error
@@ -27,6 +29,8 @@ type DB interface {
 	SystemUidDB
 	// 流
 	StreamDB
+	// 测试机
+	TesterDB
 }
 
 type MessageDB interface {
@@ -36,8 +40,9 @@ type MessageDB interface {
 
 	// AppendMessages appends messages to the db.
 	AppendMessages(channelId string, channelType uint8, msgs []Message) error
-	// AppendMessagesBatch 批量添加消息
-	AppendMessagesBatch(reqs []AppendMessagesReq) error
+	// AppendMessagesByLogs 通过日志数据追加消息
+	AppendMessagesByLogs(reqs []reactor.AppendLogReq)
+
 	// LoadPrevRangeMsgs 向上加载指定范围的消息 end=0表示不做限制 比如 start=100 end=0 limit=10 则返回的消息seq为91-100的消息, 比如 start=100 end=95 limit=10 则返回的消息seq为96-100的消息
 	// 结果包含start,不包含end
 	LoadPrevRangeMsgs(channelId string, channelType uint8, startMessageSeq, endMessageSeq uint64, limit int) ([]Message, error)
@@ -73,6 +78,9 @@ type MessageDB interface {
 
 	// RemoveMessagesOfNotifyQueue 移除通知队列的消息
 	RemoveMessagesOfNotifyQueue(messageIDs []int64) error
+
+	// RemoveMessagesOfNotifyQueueCount 移除指定数量的通知队列的消息
+	RemoveMessagesOfNotifyQueueCount(count int) error
 
 	// 搜索消息
 	SearchMessages(req MessageSearchReq) ([]Message, error)
@@ -131,6 +139,9 @@ type ChannelDB interface {
 	// GetSubscribers 获取订阅者
 	GetSubscribers(channelId string, channelType uint8) ([]Member, error)
 
+	// GetSubscriberCount 获取订阅者数量
+	GetSubscriberCount(channelId string, channelType uint8) (int, error)
+
 	// AddOrUpdateChannel  添加或更新channel
 	AddChannel(channelInfo ChannelInfo) (uint64, error)
 	// UpdateChannel 更新channel
@@ -187,8 +198,13 @@ type ChannelDB interface {
 }
 
 type ConversationDB interface {
-	// AddOrUpdateConversations 添加或更新最近会话
-	AddOrUpdateConversations(uid string, conversations []Conversation) error
+	AddOrUpdateConversations(conversations []Conversation) error
+
+	// AddOrUpdateConversationsWithUser 添加或更新最近会话
+	AddOrUpdateConversationsWithUser(uid string, conversations []Conversation) error
+
+	// UpdateConversationIfSeqGreaterAsync 如果readToMsgSeq大于当前最近会话的readToMsgSeq则更新当前最近会话 (异步操作)
+	UpdateConversationIfSeqGreaterAsync(uid, channelId string, channelType uint8, readToMsgSeq uint64) error
 
 	// DeleteConversation 删除最近会话
 	DeleteConversation(uid string, channelId string, channelType uint8) error
@@ -208,6 +224,9 @@ type ConversationDB interface {
 	// GetConversation 获取指定用户的指定会话
 	GetConversation(uid string, channelId string, channelType uint8) (Conversation, error)
 
+	// GetChannelConversationLocalUsers 获取频道的在本节点的最近会话的用户uid集合
+	GetChannelConversationLocalUsers(channelId string, channelType uint8) ([]string, error)
+
 	// ExistConversation 是否存在会话
 	ExistConversation(uid string, channelId string, channelType uint8) (bool, error)
 
@@ -221,6 +240,9 @@ type ChannelClusterConfigDB interface {
 
 	// SaveChannelClusterConfig 保存频道的分布式配置
 	SaveChannelClusterConfig(channelClusterConfig ChannelClusterConfig) error
+
+	// SaveChannelClusterConfigs 批量保存频道的分布式配置
+	SaveChannelClusterConfigs(channelClusterConfigs []ChannelClusterConfig) error
 
 	// GetChannelClusterConfig 获取频道的分布式配置
 	GetChannelClusterConfig(channelId string, channelType uint8) (ChannelClusterConfig, error)
@@ -354,6 +376,21 @@ type StreamDB interface {
 
 	// GetStreams 获取流
 	GetStreams(streamNo string) ([]*Stream, error)
+}
+
+type TesterDB interface {
+
+	// AddOrUpdateTester 添加或更新测试机
+	AddOrUpdateTester(tester Tester) error
+
+	// GetTester 获取测试机
+	GetTester(no string) (Tester, error)
+
+	// GetTesters 获取测试机列表
+	GetTesters() ([]Tester, error)
+
+	// RemoveTester 移除测试机
+	RemoveTester(no string) error
 }
 
 type MessageSearchReq struct {

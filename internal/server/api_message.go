@@ -213,7 +213,7 @@ func sendMessageToChannel(s *Server, req MessageSendReq, channelId string, chann
 		ChannelID:   channelId,
 		ChannelType: channelType,
 		Payload:     req.Payload,
-	})
+	}, true)
 	if err != nil {
 		return messageId, err
 	}
@@ -485,7 +485,7 @@ func (m *MessageAPI) syncack(c *wkhttp.Context) {
 
 	}
 	if len(conversations) > 0 {
-		err := m.s.store.AddOrUpdateConversations(req.UID, conversations)
+		err := m.s.store.AddOrUpdateUserConversations(req.UID, conversations)
 		if err != nil {
 			m.Error("消息同步回执失败！", zap.Error(err), zap.String("uid", req.UID))
 			c.ResponseError(errors.New("消息同步回执失败！"))

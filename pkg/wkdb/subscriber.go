@@ -14,7 +14,9 @@ import (
 
 func (wk *wukongDB) AddSubscribers(channelId string, channelType uint8, subscribers []Member) error {
 
-	db := wk.channelDb(channelId, channelType)
+	wk.metrics.AddSubscribersAdd(1)
+
+	db := wk.channelBatchDb(channelId, channelType)
 
 	channelPrimaryId, err := wk.getChannelPrimaryKey(channelId, channelType)
 	if err != nil {
@@ -24,8 +26,7 @@ func (wk *wukongDB) AddSubscribers(channelId string, channelType uint8, subscrib
 		return fmt.Errorf("AddSubscribers: channelId: %s channelType: %d not found", channelId, channelType)
 	}
 
-	w := db.NewIndexedBatch()
-	defer w.Close()
+	w := db.NewBatch()
 	for _, subscriber := range subscribers {
 		id := key.HashWithString(subscriber.Uid)
 		subscriber.Id = id
@@ -33,16 +34,18 @@ func (wk *wukongDB) AddSubscribers(channelId string, channelType uint8, subscrib
 			return err
 		}
 	}
-	err = wk.incChannelInfoSubscriberCount(channelPrimaryId, len(subscribers), w)
-	if err != nil {
-		wk.Error("incChannelInfoSubscriberCount failed", zap.Error(err))
-		return err
-	}
+	// err = wk.incChannelInfoSubscriberCount(channelPrimaryId, len(subscribers), w)
+	// if err != nil {
+	// 	wk.Error("incChannelInfoSubscriberCount failed", zap.Error(err))
+	// 	return err
+	// }
 
-	return w.Commit(wk.sync)
+	return w.CommitWait()
 }
 
 func (wk *wukongDB) GetSubscribers(channelId string, channelType uint8) ([]Member, error) {
+
+	wk.metrics.GetSubscribersAdd(1)
 
 	iter := wk.channelDb(channelId, channelType).NewIter(&pebble.IterOptions{
 		LowerBound: key.NewSubscriberColumnKey(channelId, channelType, 0, key.MinColumnKey),
@@ -61,14 +64,35 @@ func (wk *wukongDB) GetSubscribers(channelId string, channelType uint8) ([]Membe
 	return members, nil
 }
 
+// 获取订阅者数量
+func (wk *wukongDB) GetSubscriberCount(channelId string, channelType uint8) (int, error) {
+	iter := wk.channelDb(channelId, channelType).NewIter(&pebble.IterOptions{
+		LowerBound: key.NewSubscriberColumnKey(channelId, channelType, 0, key.TableSubscriber.Column.Uid),
+		UpperBound: key.NewSubscriberColumnKey(channelId, channelType, math.MaxUint64, key.TableSubscriber.Column.Uid),
+	})
+	defer iter.Close()
+
+	var count int
+	err := wk.iterateSubscriber(iter, func(member Member) bool {
+		count++
+		return true
+	})
+	if err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
 func (wk *wukongDB) RemoveSubscribers(channelId string, channelType uint8, subscribers []string) error {
+
+	wk.metrics.RemoveSubscribersAdd(1)
 
 	subscribers = wkutil.RemoveRepeatedElement(subscribers) // 去重复
 
-	channelPrimaryId, err := wk.getChannelPrimaryKey(channelId, channelType)
-	if err != nil {
-		return err
-	}
+	// channelPrimaryId, err := wk.getChannelPrimaryKey(channelId, channelType)
+	// if err != nil {
+	// 	return err
+	// }
 
 	// 通过uids获取订阅者对象
 	members, err := wk.getSubscribersByUids(channelId, channelType, subscribers)
@@ -86,15 +110,18 @@ func (wk *wukongDB) RemoveSubscribers(channelId string, channelType uint8, subsc
 			return err
 		}
 	}
-	err = wk.incChannelInfoSubscriberCount(channelPrimaryId, -len(members), w)
-	if err != nil {
-		wk.Error("RemoveSubscribers: incChannelInfoSubscriberCount failed", zap.Error(err))
-		return err
-	}
+	// err = wk.incChannelInfoSubscriberCount(channelPrimaryId, -len(members), w)
+	// if err != nil {
+	// 	wk.Error("RemoveSubscribers: incChannelInfoSubscriberCount failed", zap.Error(err))
+	// 	return err
+	// }
 	return w.Commit(wk.sync)
 }
 
 func (wk *wukongDB) ExistSubscriber(channelId string, channelType uint8, uid string) (bool, error) {
+
+	wk.metrics.ExistSubscriberAdd(1)
+
 	uidIndexKey := key.NewSubscriberIndexKey(channelId, channelType, key.TableSubscriber.Index.Uid, key.HashWithString(uid))
 	_, closer, err := wk.channelDb(channelId, channelType).Get(uidIndexKey)
 	if closer != nil {
@@ -110,6 +137,8 @@ func (wk *wukongDB) ExistSubscriber(channelId string, channelType uint8, uid str
 }
 
 func (wk *wukongDB) RemoveAllSubscriber(channelId string, channelType uint8) error {
+
+	wk.metrics.RemoveAllSubscriberAdd(1)
 
 	if wk.opts.EnableCost {
 		start := time.Now()
@@ -145,12 +174,12 @@ func (wk *wukongDB) RemoveAllSubscriber(channelId string, channelType uint8) err
 		return err
 	}
 
-	// 订阅者数量设置为0
-	err = wk.incChannelInfoSubscriberCount(channelPrimaryId, 0, batch)
-	if err != nil {
-		wk.Error("RemoveAllSubscriber: incChannelInfoSubscriberCount failed", zap.Error(err))
-		return err
-	}
+	// // 订阅者数量设置为0
+	// err = wk.incChannelInfoSubscriberCount(channelPrimaryId, 0, batch)
+	// if err != nil {
+	// 	wk.Error("RemoveAllSubscriber: incChannelInfoSubscriberCount failed", zap.Error(err))
+	// 	return err
+	// }
 
 	return batch.Commit(wk.sync)
 }
@@ -197,12 +226,12 @@ func (wk *wukongDB) getSubscribersByUids(channelId string, channelType uint8, ui
 }
 
 // 增加频道白名单数量
-func (wk *wukongDB) incChannelInfoSubscriberCount(id uint64, count int, batch *pebble.Batch) error {
-	wk.dblock.subscriberCountLock.lock(id)
-	defer wk.dblock.subscriberCountLock.unlock(id)
+// func (wk *wukongDB) incChannelInfoSubscriberCount(id uint64, count int, batch *Batch) error {
+// 	wk.dblock.subscriberCountLock.lock(id)
+// 	defer wk.dblock.subscriberCountLock.unlock(id)
 
-	return wk.incChannelInfoColumnCount(id, key.TableChannelInfo.Column.SubscriberCount, key.TableChannelInfo.SecondIndex.SubscriberCount, count, batch)
-}
+// 	return wk.incChannelInfoColumnCount(id, key.TableChannelInfo.Column.SubscriberCount, key.TableChannelInfo.SecondIndex.SubscriberCount, count, batch)
+// }
 
 func (wk *wukongDB) iterateSubscriber(iter *pebble.Iterator, iterFnc func(member Member) bool) error {
 
@@ -257,38 +286,28 @@ func (wk *wukongDB) iterateSubscriber(iter *pebble.Iterator, iterFnc func(member
 	return nil
 }
 
-func (wk *wukongDB) writeSubscriber(channelId string, channelType uint8, member Member, w pebble.Writer) error {
-	var (
-		err error
-	)
+func (wk *wukongDB) writeSubscriber(channelId string, channelType uint8, member Member, w *Batch) error {
+
 	if member.Id == 0 {
 		return errors.New("writeSubscriber: member.Id is 0")
 	}
 	// uid
-	if err = w.Set(key.NewSubscriberColumnKey(channelId, channelType, member.Id, key.TableSubscriber.Column.Uid), []byte(member.Uid), wk.noSync); err != nil {
-		return err
-	}
+	w.Set(key.NewSubscriberColumnKey(channelId, channelType, member.Id, key.TableSubscriber.Column.Uid), []byte(member.Uid))
 
 	// uid index
 	idBytes := make([]byte, 8)
 	wk.endian.PutUint64(idBytes, member.Id)
-	if err = w.Set(key.NewSubscriberIndexKey(channelId, channelType, key.TableSubscriber.Index.Uid, member.Id), idBytes, wk.noSync); err != nil {
-		return err
-	}
+	w.Set(key.NewSubscriberIndexKey(channelId, channelType, key.TableSubscriber.Index.Uid, member.Id), idBytes)
 
 	// createdAt
 	if member.CreatedAt != nil {
 		ct := uint64(member.CreatedAt.UnixNano())
 		createdAt := make([]byte, 8)
 		wk.endian.PutUint64(createdAt, ct)
-		if err = w.Set(key.NewSubscriberColumnKey(channelId, channelType, member.Id, key.TableSubscriber.Column.CreatedAt), createdAt, wk.noSync); err != nil {
-			return err
-		}
+		w.Set(key.NewSubscriberColumnKey(channelId, channelType, member.Id, key.TableSubscriber.Column.CreatedAt), createdAt)
 
 		// createdAt second index
-		if err = w.Set(key.NewSubscriberSecondIndexKey(channelId, channelType, key.TableSubscriber.SecondIndex.CreatedAt, ct, member.Id), nil, wk.noSync); err != nil {
-			return err
-		}
+		w.Set(key.NewSubscriberSecondIndexKey(channelId, channelType, key.TableSubscriber.SecondIndex.CreatedAt, ct, member.Id), nil)
 
 	}
 
@@ -296,14 +315,9 @@ func (wk *wukongDB) writeSubscriber(channelId string, channelType uint8, member 
 		// updatedAt
 		updatedAt := make([]byte, 8)
 		wk.endian.PutUint64(updatedAt, uint64(member.UpdatedAt.UnixNano()))
-		if err = w.Set(key.NewSubscriberColumnKey(channelId, channelType, member.Id, key.TableSubscriber.Column.UpdatedAt), updatedAt, wk.noSync); err != nil {
-			return err
-		}
-
+		w.Set(key.NewSubscriberColumnKey(channelId, channelType, member.Id, key.TableSubscriber.Column.UpdatedAt), updatedAt)
 		// updatedAt second index
-		if err = w.Set(key.NewSubscriberSecondIndexKey(channelId, channelType, key.TableSubscriber.SecondIndex.UpdatedAt, uint64(member.UpdatedAt.UnixNano()), member.Id), nil, wk.noSync); err != nil {
-			return err
-		}
+		w.Set(key.NewSubscriberSecondIndexKey(channelId, channelType, key.TableSubscriber.SecondIndex.UpdatedAt, uint64(member.UpdatedAt.UnixNano()), member.Id), nil)
 	}
 
 	return nil

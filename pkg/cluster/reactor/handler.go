@@ -3,11 +3,11 @@ package reactor
 import (
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/replica"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"go.uber.org/atomic"
+	"go.uber.org/zap"
 )
 
 type IHandler interface {
@@ -56,7 +56,7 @@ type IHandler interface {
 	GetLogs(startLogIndex, endLogIndex uint64) ([]replica.Log, error)
 
 	// AppendLogs 追加日志
-	AppendLogs(logs []replica.Log) error
+	// AppendLogs(logs []replica.Log) error
 
 	// SetLeaderTermStartIndex 设置领导任期和开始索引
 	SetLeaderTermStartIndex(term uint32, index uint64) error
@@ -77,6 +77,7 @@ type IHandler interface {
 
 type handler struct {
 	key      string
+	no       string // handler唯一编号
 	handler  IHandler
 	msgQueue *MessageQueue
 
@@ -92,13 +93,6 @@ type handler struct {
 
 	syncTimeoutTick int // 同步超时tick次数
 
-	sync struct {
-		syncingLogIndex uint64        // 正在同步的日志索引
-		syncStatus      syncStatus    // 是否正在同步
-		startSyncTime   time.Time     // 开始同步时间
-		syncTimeout     time.Duration // 同步超时时间
-		resp            replica.Message
-	}
 	wklog.Log
 	r *Reactor
 }
@@ -116,7 +110,6 @@ func (h *handler) init(key string, handler IHandler, r *Reactor) {
 	h.lastIndex.Store(0)
 
 	h.proposeWait = newProposeWait(fmt.Sprintf("[%d]%s", r.opts.NodeId, key))
-	h.sync.syncTimeout = 5 * time.Second
 
 }
 
@@ -128,15 +121,7 @@ func (h *handler) reset() {
 	h.msgQueue = nil
 	h.proposeWait = nil
 	h.proposeIntervalTick = 0
-	h.resetSync()
 	h.hardState = replica.HardState{}
-}
-
-func (h *handler) resetSync() {
-	h.sync.syncStatus = syncStatusNone
-	h.sync.syncingLogIndex = 0
-	h.sync.startSyncTime = time.Time{}
-	h.sync.resp = replica.EmptyMessage
 
 }
 
@@ -148,13 +133,21 @@ func (h *handler) hasReady() bool {
 	return h.handler.HasReady()
 }
 
+func (h *handler) step(m replica.Message) error {
+	if m.HandlerNo != "" && m.HandlerNo != h.no {
+		h.Warn("step failed,ignore，message does not belong to it", zap.String("msgType", m.MsgType.String()), zap.String("expectHandlerNo", h.no), zap.String("acthandlerNo", m.HandlerNo))
+		return nil
+	}
+	return h.handler.Step(m)
+}
+
 func (h *handler) setHardState(hd replica.HardState) {
 	h.hardState = hd
 	h.handler.SetHardState(hd)
 }
 
-func (h *handler) didPropose(key string, minIndex uint64, maxIndex uint64) {
-	h.proposeWait.didPropose(key, minIndex, maxIndex)
+func (h *handler) didPropose(key string, minIndex uint64, maxIndex uint64, term uint32) {
+	h.proposeWait.didPropose(key, minIndex, maxIndex, term)
 }
 
 func (h *handler) didCommit(startLogIndex uint64, endLogIndex uint64) {

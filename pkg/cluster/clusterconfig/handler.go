@@ -67,35 +67,35 @@ func newHandler(cfg *Config, storage *PebbleShardLogStorage, s *Server) *handler
 	return h
 }
 
-func (h *handler) updateConfig() {
-	nodes := h.cfg.allowVoteNodes()
-	replicas := make([]uint64, 0, len(nodes))
-	for _, node := range nodes {
-		replicas = append(replicas, node.Id)
-	}
+// func (h *handler) updateConfig() {
+// 	nodes := h.cfg.allowVoteNodes()
+// 	replicas := make([]uint64, 0, len(nodes))
+// 	for _, node := range nodes {
+// 		replicas = append(replicas, node.Id)
+// 	}
 
-	for replicaId := range h.opts.InitNodes {
-		exist := false
-		for _, replica := range replicas {
-			if replicaId == replica {
-				exist = true
-				break
-			}
-		}
-		if !exist {
-			replicas = append(replicas, replicaId)
-		}
+// 	for replicaId := range h.opts.InitNodes {
+// 		exist := false
+// 		for _, replica := range replicas {
+// 			if replicaId == replica {
+// 				exist = true
+// 				break
+// 			}
+// 		}
+// 		if !exist {
+// 			replicas = append(replicas, replicaId)
+// 		}
 
-	}
+// 	}
 
-	h.s.configReactor.Step(h.s.handlerKey, replica.Message{
-		MsgType: replica.MsgConfigResp,
-		Config: replica.Config{
-			Replicas: replicas,
-		},
-	})
+// 	h.s.configReactor.Step(h.s.handlerKey, replica.Message{
+// 		MsgType: replica.MsgConfigResp,
+// 		Config: replica.Config{
+// 			Replicas: replicas,
+// 		},
+// 	})
 
-}
+// }
 
 // 获取某个副本的最新配置版本（领导节点才有这个信息）
 func (h *handler) configVersion(replicaId uint64) uint64 {
@@ -176,6 +176,10 @@ func (h *handler) getLogs(startLogIndex uint64, endLogIndex uint64) ([]replica.L
 func (h *handler) SetHardState(hd replica.HardState) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+
+	if hd.LeaderId != h.leaderId {
+		h.Info("config leader change", zap.Uint64("oldLeader", h.leaderId), zap.Uint64("newLeader", hd.LeaderId))
+	}
 	h.leaderId = hd.LeaderId
 
 }

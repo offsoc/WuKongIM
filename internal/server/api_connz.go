@@ -73,8 +73,10 @@ func (co *ConnzAPI) HandleConnz(c *wkhttp.Context) {
 		sortOpt = SortOpt(sortStr)
 	}
 	var connInfos []*ConnInfo
+
 	resultConns := co.s.GetConnInfos(uid, sortOpt, offset, limit)
 	connInfos = make([]*ConnInfo, 0, len(resultConns))
+
 	for _, resultConn := range resultConns {
 
 		connInfo := newConnInfo(resultConn)
@@ -105,11 +107,13 @@ func (co *ConnzAPI) HandleConnz(c *wkhttp.Context) {
 
 func (s *Server) GetConnInfos(uid string, sortOpt SortOpt, offset, limit int) []*connContext {
 	connCtxs := make([]*connContext, 0, s.engine.ConnCount())
+
 	s.engine.Iterator(func(c wknet.Conn) bool {
-		if c.Context() == nil { // 没有上下文的连接不处理
+		ctx := c.Context()
+		if ctx == nil { // 没有上下文的连接不处理
 			return true
 		}
-		connCtx := c.Context().(*connContext)
+		connCtx := ctx.(*connContext)
 		if strings.TrimSpace(uid) != "" {
 			if strings.Contains(connCtx.uid, uid) {
 				connCtxs = append(connCtxs, connCtx)
@@ -238,14 +242,16 @@ func newConnInfo(connCtx *connContext) *ConnInfo {
 	}
 	connStats := connCtx.connStats
 
+	lastActivity := time.Unix(connCtx.lastActivity.Load(), 0)
+
 	return &ConnInfo{
 		ID:           connCtx.connId,
 		UID:          connCtx.uid,
 		IP:           host,
 		Port:         port,
-		LastActivity: connCtx.lastActivity.Load(),
+		LastActivity: lastActivity,
 		Uptime:       myUptime(now.Sub(connCtx.uptime.Load())),
-		Idle:         myUptime(now.Sub(connCtx.lastActivity.Load())),
+		Idle:         myUptime(now.Sub(lastActivity)),
 		// PendingBytes:   c.OutboundBuffer().BoundBufferSize(),
 		InMsgs:         connStats.inMsgCount.Load(),
 		OutMsgs:        connStats.outMsgCount.Load(),
@@ -535,7 +541,7 @@ func (l byUptimeDesc) Swap(i, j int) { l.Conns[i], l.Conns[j] = l.Conns[j], l.Co
 type byIdle struct{ Conns []*connContext }
 
 func (l byIdle) Less(i, j int) bool {
-	return l.Conns[i].lastActivity.Load().Before(l.Conns[j].lastActivity.Load())
+	return l.Conns[i].lastActivity.Load() < l.Conns[j].lastActivity.Load()
 }
 func (l byIdle) Len() int      { return len(l.Conns) }
 func (l byIdle) Swap(i, j int) { l.Conns[i], l.Conns[j] = l.Conns[j], l.Conns[i] }
@@ -544,7 +550,7 @@ func (l byIdle) Swap(i, j int) { l.Conns[i], l.Conns[j] = l.Conns[j], l.Conns[i]
 type byIdleDesc struct{ Conns []*connContext }
 
 func (l byIdleDesc) Less(i, j int) bool {
-	return l.Conns[i].lastActivity.Load().After(l.Conns[j].lastActivity.Load())
+	return l.Conns[i].lastActivity.Load() < l.Conns[j].lastActivity.Load()
 }
 func (l byIdleDesc) Len() int      { return len(l.Conns) }
 func (l byIdleDesc) Swap(i, j int) { l.Conns[i], l.Conns[j] = l.Conns[j], l.Conns[i] }

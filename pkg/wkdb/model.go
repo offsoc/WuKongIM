@@ -388,7 +388,7 @@ func (c ConversationSet) Marshal() ([]byte, error) {
 	return enc.Bytes(), nil
 }
 
-func (c ConversationSet) Unmarshal(data []byte) error {
+func (c *ConversationSet) Unmarshal(data []byte) error {
 	dec := wkproto.NewDecoder(data)
 	var err error
 	var size uint16
@@ -405,7 +405,7 @@ func (c ConversationSet) Unmarshal(data []byte) error {
 		if err = v.Unmarshal(data); err != nil {
 			return err
 		}
-		c = append(c, v)
+		*c = append(*c, v)
 	}
 	return nil
 }
@@ -784,6 +784,38 @@ func (m *Member) Unmarshal(data []byte) error {
 	if updatedAt > 0 {
 		ct := time.Unix(int64(updatedAt/1e9), int64(updatedAt%1e9))
 		m.UpdatedAt = &ct
+	}
+	return nil
+}
+
+type Tester struct {
+	Id        uint64
+	No        string
+	Addr      string
+	CreatedAt *time.Time
+	UpdatedAt *time.Time
+}
+
+func (t *Tester) Marshal() ([]byte, error) {
+	enc := wkproto.NewEncoder()
+	defer enc.End()
+	enc.WriteUint64(t.Id)
+	enc.WriteString(t.No)
+	enc.WriteString(t.Addr)
+	return enc.Bytes(), nil
+}
+
+func (t *Tester) Unmarshal(data []byte) error {
+	dec := wkproto.NewDecoder(data)
+	var err error
+	if t.Id, err = dec.Uint64(); err != nil {
+		return err
+	}
+	if t.No, err = dec.String(); err != nil {
+		return err
+	}
+	if t.Addr, err = dec.String(); err != nil {
+		return err
 	}
 	return nil
 }

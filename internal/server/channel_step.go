@@ -2,6 +2,7 @@ package server
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
@@ -19,7 +20,7 @@ func (c *channel) step(a *ChannelAction) error {
 	switch a.ActionType {
 	case ChannelActionInitResp: // 初始化返回
 		if a.Reason == ReasonSuccess {
-			c.initTick = c.opts.Reactor.Channel.ProcessIntervalTick // 立即处理下个逻辑
+			c.initState.ProcessSuccess()
 			c.status = channelStatusInitialized
 			if a.LeaderId == c.r.opts.Cluster.NodeId {
 				c.becomeLeader()
@@ -27,7 +28,7 @@ func (c *channel) step(a *ChannelAction) error {
 				c.becomeProxy(a.LeaderId)
 			}
 		} else {
-			c.status = channelStatusUninitialized
+			c.initState.ProcessFail()
 		}
 		// c.Info("channel init resp", zap.Int("status", int(c.status)), zap.Uint64("leaderId", c.leaderId))
 
@@ -77,39 +78,43 @@ func (c *channel) step(a *ChannelAction) error {
 		}
 		// c.Debug("channel send", zap.Int("messageCount", len(a.Messages)), zap.String("channelId", c.channelId), zap.Uint8("channelType", c.channelType))
 	case ChannelActionPayloadDecryptResp: // payload解密
-		c.payloadDecrypting = false
-		c.payloadDecryptingTick = 0
-		if len(a.Messages) == 0 {
-			return nil
-		}
+		if a.Reason == ReasonSuccess {
+			c.payloadDecryptState.ProcessSuccess()
+			if len(a.Messages) == 0 {
+				return nil
+			}
 
-		lastMsg := a.Messages[len(a.Messages)-1]
+			lastMsg := a.Messages[len(a.Messages)-1]
 
-		startIndex := c.msgQueue.getArrayIndex(c.msgQueue.payloadDecryptingIndex)
+			startIndex := c.msgQueue.getArrayIndex(c.msgQueue.payloadDecryptingIndex)
 
-		if lastMsg.Index > c.msgQueue.payloadDecryptingIndex {
-			c.msgQueue.payloadDecryptingIndex = lastMsg.Index
-		}
+			if lastMsg.Index > c.msgQueue.payloadDecryptingIndex {
+				c.msgQueue.payloadDecryptingIndex = lastMsg.Index
+			}
 
-		endIndex := c.msgQueue.getArrayIndex(c.msgQueue.payloadDecryptingIndex)
+			endIndex := c.msgQueue.getArrayIndex(c.msgQueue.payloadDecryptingIndex)
 
-		if startIndex >= endIndex {
-			return nil
-		}
+			if startIndex >= endIndex {
+				fmt.Println("startIndex >= endIndex", startIndex, endIndex)
+				return nil
+			}
 
-		msgLen := len(a.Messages)
-		for i := startIndex; i < endIndex; i++ {
-			msg := c.msgQueue.messages[i]
-			for j := 0; j < msgLen; j++ {
-				decryptMsg := a.Messages[j]
-				if msg.MessageId == decryptMsg.MessageId {
-					msg.SendPacket.Payload = decryptMsg.SendPacket.Payload
-					msg.IsEncrypt = decryptMsg.IsEncrypt
-					msg.ReasonCode = decryptMsg.ReasonCode
-					c.msgQueue.messages[i] = msg
-					break
+			msgLen := len(a.Messages)
+			for i := startIndex; i < endIndex; i++ {
+				msg := c.msgQueue.messages[i]
+				for j := 0; j < msgLen; j++ {
+					decryptMsg := a.Messages[j]
+					if msg.MessageId == decryptMsg.MessageId {
+						msg.SendPacket.Payload = decryptMsg.SendPacket.Payload
+						msg.IsEncrypt = decryptMsg.IsEncrypt
+						msg.ReasonCode = decryptMsg.ReasonCode
+						c.msgQueue.messages[i] = msg
+						break
+					}
 				}
 			}
+		} else {
+			c.payloadDecryptState.ProcessFail()
 		}
 	case ChannelActionStreamPayloadDecryptResp: // stream payload解密
 		if len(a.Messages) == 1 {
@@ -149,77 +154,92 @@ func (c *channel) step(a *ChannelAction) error {
 func (c *channel) stepLeader(a *ChannelAction) error {
 	switch a.ActionType {
 	case ChannelActionPermissionCheckResp: // 权限校验返回
-		c.permissionChecking = false // 设置为false，则不需要等待可以继续处理下一批请求
-		c.permissionCheckingTick = 0
-		startIndex := c.msgQueue.getArrayIndex(c.msgQueue.permissionCheckingIndex)
-
-		if a.Index > c.msgQueue.permissionCheckingIndex {
-			c.msgQueue.permissionCheckingIndex = a.Index
-		}
-		endIndex := c.msgQueue.getArrayIndex(a.Index)
-		if startIndex >= endIndex {
-			return nil
-		}
-		msgLen := len(a.Messages)
-		for i := startIndex; i < endIndex; i++ {
-			msg := c.msgQueue.messages[i]
-			for j := 0; j < msgLen; j++ {
-				permMsg := a.Messages[j]
-				if msg.MessageId == permMsg.MessageId {
-					msg.ReasonCode = permMsg.ReasonCode
-					c.msgQueue.messages[i] = msg
-					break
+		if a.Reason == ReasonSuccess {
+			c.permissionCheckState.ProcessSuccess()
+			startIndex := c.msgQueue.getArrayIndex(c.msgQueue.permissionCheckingIndex)
+			if a.Index > c.msgQueue.permissionCheckingIndex {
+				c.msgQueue.permissionCheckingIndex = a.Index
+			}
+			endIndex := c.msgQueue.getArrayIndex(a.Index)
+			if startIndex >= endIndex {
+				return nil
+			}
+			msgLen := len(a.Messages)
+			for i := startIndex; i < endIndex; i++ {
+				msg := c.msgQueue.messages[i]
+				for j := 0; j < msgLen; j++ {
+					permMsg := a.Messages[j]
+					if msg.MessageId == permMsg.MessageId {
+						msg.ReasonCode = permMsg.ReasonCode
+						c.msgQueue.messages[i] = msg
+						break
+					}
 				}
 			}
+		} else {
+			c.permissionCheckState.ProcessFail()
 		}
-
-		// c.Info("channel permission check resp", zap.Int("messageCount", len(a.Messages)), zap.String("channelId", c.channelId), zap.Uint8("channelType", c.channelType))
-
 	case ChannelActionStorageResp: // 存储完成
-		c.storaging = false // 设置为false，则不需要等待可以继续处理下一批请求
-		c.storageTick = 0
-		startIndex := c.msgQueue.getArrayIndex(c.msgQueue.storagingIndex)
-		if a.Index > c.msgQueue.storagingIndex {
-			c.msgQueue.storagingIndex = a.Index
-		}
-		endIndex := c.msgQueue.getArrayIndex(c.msgQueue.storagingIndex)
+		if a.Reason == ReasonSuccess {
+			c.storageState.ProcessSuccess()
+			startIndex := c.msgQueue.getArrayIndex(c.msgQueue.storagingIndex)
+			if a.Index > c.msgQueue.storagingIndex {
+				c.msgQueue.storagingIndex = a.Index
+			}
+			endIndex := c.msgQueue.getArrayIndex(c.msgQueue.storagingIndex)
 
-		if startIndex >= endIndex {
-			return nil
-		}
-		msgLen := len(a.Messages)
-		for i := startIndex; i < endIndex; i++ {
-			msg := c.msgQueue.messages[i]
-			for j := 0; j < msgLen; j++ {
-				storedMsg := a.Messages[j]
-				if msg.MessageId == storedMsg.MessageId {
-					msg.MessageSeq = storedMsg.MessageSeq
-					msg.ReasonCode = storedMsg.ReasonCode
-					c.msgQueue.messages[i] = msg
-					break
+			if startIndex >= endIndex {
+				return nil
+			}
+			msgLen := len(a.Messages)
+			for i := startIndex; i < endIndex; i++ {
+				msg := c.msgQueue.messages[i]
+				for j := 0; j < msgLen; j++ {
+					storedMsg := a.Messages[j]
+					if msg.MessageId == storedMsg.MessageId {
+						msg.MessageSeq = storedMsg.MessageSeq
+						msg.ReasonCode = storedMsg.ReasonCode
+						c.msgQueue.messages[i] = msg
+						break
+					}
 				}
 			}
+		} else {
+			c.storageState.ProcessFail()
 		}
+
 	// 消息存储完毕后，需要通知发送者
 	// c.exec(&ChannelAction{ActionType: ChannelActionSendack, Messages: a.Messages, Reason: a.Reason, ReasonCode: a.ReasonCode})
 
 	// c.Info("channel storage resp", zap.Int("messageCount", len(a.Messages)), zap.String("channelId", c.channelId), zap.Uint8("channelType", c.channelType))
 
 	case ChannelActionSendackResp: // 发送ack返回
-
-		c.sendacking = false // 设置为false，则不需要等待可以继续处理下一批请求
-		c.sendackingTick = 0
-		if a.Index > c.msgQueue.sendackingIndex {
-			c.msgQueue.sendackingIndex = a.Index
+		if a.Reason == ReasonSuccess {
+			c.sendackState.ProcessSuccess() // 设置为false，则不需要等待可以继续处理下一批请求
+			if a.Index > c.msgQueue.sendackingIndex {
+				c.msgQueue.sendackingIndex = a.Index
+				// 只有投递消息的deliveringIndex也达到这个位置时，才能删除消息
+				if c.msgQueue.deliveringIndex >= c.msgQueue.sendackingIndex {
+					c.msgQueue.truncateTo(a.Index)
+				}
+			}
+		} else {
+			c.sendackState.ProcessFail()
 		}
 
 	case ChannelActionDeliverResp: // 消息投递返回
-		c.delivering = false // 设置为false，则不需要等待可以继续处理下一批请求
-		c.deliveringTick = 0
-		if a.Index > c.msgQueue.deliveringIndex {
-			c.msgQueue.deliveringIndex = a.Index
-			c.msgQueue.truncateTo(a.Index)
+		if a.Reason == ReasonSuccess {
+			c.deliveryState.ProcessSuccess()
+			if a.Index > c.msgQueue.deliveringIndex {
+				c.msgQueue.deliveringIndex = a.Index
 
+				// 只有sendack也达到这个位置时，才能删除消息
+				if c.msgQueue.sendackingIndex >= c.msgQueue.deliveringIndex {
+					c.msgQueue.truncateTo(a.Index)
+				}
+			}
+		} else {
+			c.deliveryState.ProcessFail()
 		}
 	// c.Info("channel deliver resp", zap.Int("messageCount", len(a.Messages)), zap.String("channelId", c.channelId), zap.Uint8("channelType", c.channelType))
 	case ChannelActionStreamDeliverResp: // stream消息投递返回
@@ -257,19 +277,19 @@ func (c *channel) stepProxy(a *ChannelAction) error {
 	switch a.ActionType {
 	case ChannelActionForwardResp: // 转发
 		if a.Reason == ReasonSuccess {
-			c.forwarding = false
-			c.forwardTick = 0
-		}
-
-		if len(a.Messages) == 0 {
-			return nil
-		}
-		if a.Reason == ReasonSuccess {
-			lastMsg := a.Messages[len(a.Messages)-1]
-			if lastMsg.Index > c.msgQueue.forwardingIndex {
-				c.msgQueue.forwardingIndex = lastMsg.Index
-				c.msgQueue.truncateTo(lastMsg.Index)
+			c.forwardState.ProcessSuccess()
+			if len(a.Messages) == 0 {
+				return nil
 			}
+			if a.Reason == ReasonSuccess {
+				lastMsg := a.Messages[len(a.Messages)-1]
+				if lastMsg.Index > c.msgQueue.forwardingIndex {
+					c.msgQueue.forwardingIndex = lastMsg.Index
+					c.msgQueue.truncateTo(lastMsg.Index)
+				}
+			}
+		} else {
+			c.forwardState.ProcessFail()
 		}
 
 	}

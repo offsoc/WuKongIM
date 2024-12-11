@@ -1,6 +1,8 @@
 package server
 
 import (
+	"math/rand/v2"
+
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 	"go.uber.org/zap"
@@ -58,6 +60,13 @@ func (r *retryManager) removeRetry(connId int64, messageId int64) error {
 	return r.retryQueues[index].finishMessage(connId, messageId)
 }
 
+// 获取重试消息
+func (r *retryManager) retryMessage(connId int64, messageId int64) *retryMessage {
+	index := messageId % int64(len(r.retryQueues))
+
+	return r.retryQueues[index].getInFlightMessage(connId, messageId)
+}
+
 func (r *retryManager) retry(msg *retryMessage) {
 	r.Debug("retry msg", zap.Int("retryCount", msg.retry), zap.String("uid", msg.uid), zap.Int64("messageId", msg.messageId), zap.Int64("connId", msg.connId))
 	msg.retry++
@@ -79,7 +88,10 @@ func (r *retryManager) retry(msg *retryMessage) {
 	r.addRetry(msg)
 
 	// 发送消息
-	r.Info("retry send message", zap.String("uid", msg.uid), zap.Int64("messageId", msg.messageId), zap.Int64("connId", msg.connId))
+	// 在需要打印日志的地方添加概率控制
+	if rand.Float64() < 0.1 { // 10%的概率
+		r.Info("retry send message", zap.Int("retry", msg.retry), zap.String("uid", msg.uid), zap.Int64("messageId", msg.messageId), zap.Int64("connId", msg.connId))
+	}
 	err := conn.write(msg.recvPacketData, wkproto.RECV)
 	if err != nil {
 		r.Warn("write message failed", zap.String("uid", msg.uid), zap.Int64("messageId", msg.messageId), zap.Int64("connId", msg.connId), zap.Error(err))
@@ -91,6 +103,8 @@ func (r *retryManager) retry(msg *retryMessage) {
 
 type retryMessage struct {
 	recvPacketData []byte // 接受包数据
+	channelId      string // 频道id
+	channelType    uint8  // 频道类型
 	uid            string // 用户id
 	connId         int64  // 需要接受的连接id
 	messageId      int64  // 消息id

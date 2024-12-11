@@ -2,9 +2,11 @@ package icluster
 
 import (
 	"context"
+	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/clusterconfig/pb"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/replica"
+	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver"
 	"github.com/WuKongIM/WuKongIM/pkg/wkserver/proto"
 )
@@ -18,6 +20,8 @@ type Cluster interface {
 	LeaderIdOfChannel(ctx context.Context, channelId string, channelType uint8) (nodeId uint64, err error)
 	// LeaderOfChannel 获取channel的leader节点信息
 	LeaderOfChannel(ctx context.Context, channelId string, channelType uint8) (nodeInfo *pb.Node, err error)
+	// LoadOrCreateChannel 加载或创建频道（此方法会激活频道）
+	LoadOrCreateChannel(ctx context.Context, channelId string, channelType uint8) (wkdb.ChannelClusterConfig, error)
 	// SlotLeaderIdOfChannel 获取channel的leader节点信息(不激活频道)
 	LeaderOfChannelForRead(channelId string, channelType uint8) (nodeInfo *pb.Node, err error)
 	// SlotLeaderIdOfChannel 获取频道所属槽的领导
@@ -46,16 +50,20 @@ type Cluster interface {
 	// SlotLeaderNodeInfo 获取槽的节点信息
 	SlotLeaderNodeInfo(slotId uint32) (nodeInfo *pb.Node, err error)
 
+	// LoadOnlyChannelClusterConfig 加载频道配置，仅仅只加载配置，
+	LoadOnlyChannelClusterConfig(channelId string, channelType uint8) (wkdb.ChannelClusterConfig, error)
+
 	// 领导者Id
 	LeaderId() uint64
 
 	// 等待集群准备好
-	MustWaitClusterReady()
+	MustWaitClusterReady(timeout time.Duration)
 
 	// 等待所有槽准备好
-	MustWaitAllSlotsReady()
-	// Monitor 获取监控信息
-	// Monitor() IMonitor
+	MustWaitAllSlotsReady(timeout time.Duration)
+
+	// 测试分布式节点网络的ping
+	TestPing() ([]PingResult, error)
 }
 
 type Propose interface {
@@ -64,10 +72,16 @@ type Propose interface {
 	// ProposeToSlots 提案日志到指定的槽
 	ProposeToSlot(ctx context.Context, slotId uint32, logs []replica.Log) ([]ProposeResult, error)
 	// ProposeDataToSlot 提案数据到指定的槽
-	ProposeDataToSlot(ctx context.Context, slotId uint32, data []byte) (ProposeResult, error)
+	ProposeDataToSlot(slotId uint32, data []byte) (ProposeResult, error)
 }
 
 type ProposeResult interface {
 	LogId() uint64    // 日志Id
 	LogIndex() uint64 // 日志下标
+}
+
+type PingResult struct {
+	NodeId      uint64 // 响应的节点id
+	Err         error  // 错误信息
+	Millisecond int64  // 耗时
 }

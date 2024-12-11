@@ -6,10 +6,16 @@ import (
 
 func (r *Replica) Step(m Message) error {
 
+	if r.detailLogOn {
+		r.Info("step...", zap.String("msgType", m.MsgType.String()), zap.Uint32("term", m.Term), zap.Uint64("index", m.Index), zap.Int("logs", len(m.Logs)), zap.Int("status", int(r.status)), zap.String("role", r.role.String()))
+	}
+
 	switch {
 	case m.Term == 0: // 本地消息
 	case m.Term > r.term: // 高于当前任期
-		r.Info("received message with higher term", zap.Uint32("term", m.Term), zap.Uint32("currentTerm", r.term), zap.Uint64("from", m.From), zap.Uint64("to", m.To), zap.String("msgType", m.MsgType.String()))
+		if r.term > 0 {
+			r.Info("received message with higher term", zap.Uint32("term", m.Term), zap.Uint32("currentTerm", r.term), zap.Uint64("from", m.From), zap.Uint64("to", m.To), zap.String("msgType", m.MsgType.String()))
+		}
 		// 高任期消息
 		if m.MsgType == MsgPing || m.MsgType == MsgLeaderTermStartIndexResp || m.MsgType == MsgSyncResp {
 			if r.role == RoleLearner {
@@ -34,9 +40,13 @@ func (r *Replica) Step(m Message) error {
 
 	switch m.MsgType {
 	case MsgInitResp: // 初始化返回
-		r.status = StatusReady
-		if !m.Reject && !IsEmptyConfig(m.Config) {
-			r.switchConfig(m.Config)
+		if !m.Reject {
+			r.initState.ProcessSuccess()
+			if !IsEmptyConfig(m.Config) {
+				r.switchConfig(m.Config)
+			}
+		} else {
+			r.initState.ProcessFail()
 		}
 
 	case MsgHup: // 触发选举
@@ -59,21 +69,29 @@ func (r *Replica) Step(m Message) error {
 			r.send(r.newMsgVoteResp(m.From, r.term, true))
 		}
 	case MsgStoreAppendResp: // 存储返回
-		r.replicaLog.storaging = false
 		if !m.Reject {
+			r.storageState.ProcessSuccess()
 			r.replicaLog.storagedTo(m.Index)
+		} else {
+			r.storageState.ProcessFail()
+			r.Info("store append reject", zap.Uint64("nodeId", r.nodeId), zap.Uint32("term", r.term), zap.Uint64("index", m.Index))
 		}
 
 	case MsgApplyLogsResp: // 应用日志返回
-		r.replicaLog.applying = false
 		if !m.Reject {
+			r.applyState.ProcessSuccess()
+			if m.Index < r.replicaLog.appliedIndex {
+				r.Warn("applied index is less than current applied index", zap.Uint64("nodeId", r.nodeId), zap.Uint32("term", r.term), zap.Uint64("index", m.Index), zap.Uint64("appliedIndex", r.replicaLog.appliedIndex))
+				return nil
+			}
 			r.replicaLog.appliedTo(m.Index)
 			if m.AppliedSize == 0 {
 				r.uncommittedSize = 0
 			} else {
 				r.reduceUncommittedSize(logEncodingSize(m.AppliedSize))
 			}
-
+		} else {
+			r.applyState.ProcessFail()
 		}
 
 	case MsgConfigResp:
@@ -154,13 +172,23 @@ func (r *Replica) stepLeader(m Message) error {
 		// }
 
 	case MsgSyncGetResp:
+		r.setSyncing(m.To, false)
 		if !m.Reject {
 			r.send(r.newMsgSyncResp(m.To, m.Index, m.Logs))
 		}
 
 	case MsgSyncReq:
-
 		lastIndex := r.replicaLog.lastLogIndex
+		if r.detailLogOn {
+			r.Info("sync req", zap.Uint64("from", m.From), zap.Uint64("index", m.Index), zap.Uint64("lastIndex", lastIndex))
+		}
+
+		if r.isSyncing(m.From) {
+			r.Info("sync req, but is syncing", zap.Uint64("from", m.From), zap.Uint64("index", m.Index), zap.Uint64("lastIndex", lastIndex))
+			return nil
+		}
+		r.setSyncing(m.From, true)
+
 		if m.Index <= lastIndex {
 			unstableLogs, exceed, err := r.replicaLog.getLogsFromUnstable(m.Index, lastIndex+1, logEncodingSize(r.opts.SyncLimitSize))
 			if err != nil {
@@ -174,12 +202,14 @@ func (r *Replica) stepLeader(m Message) error {
 					r.Panic("get logs from unstable failed", zap.Uint64("nodeId", r.nodeId), zap.Uint64("from", m.From), zap.Uint64("index", m.Index), zap.Uint64("lastIndex", lastIndex), zap.Uint64("firstIndex", unstableLogs[0].Index))
 				}
 				r.send(r.newMsgSyncResp(m.From, m.Index, unstableLogs))
+				r.setSyncing(m.From, false)
 			} else {
 				// 如果未满足条件，则发起日志获取请求，让上层去查询剩余日志
 				r.send(r.newMsgSyncGet(m.From, m.Index, unstableLogs))
 			}
 		} else {
 			r.send(r.newMsgSyncResp(m.From, m.Index, nil))
+			r.setSyncing(m.From, false)
 		}
 
 		isLearner := r.isLearner(m.From) // 当前同步节点是否是学习者
@@ -230,6 +260,17 @@ func (r *Replica) stepLeader(m Message) error {
 	return nil
 }
 
+// 是否同步中
+func (r *Replica) isSyncing(from uint64) bool {
+	v := r.handleSyncReplicaMap[from]
+	return v
+}
+
+// 设置同步中
+func (r *Replica) setSyncing(from uint64, v bool) {
+	r.handleSyncReplicaMap[from] = v
+}
+
 func (r *Replica) stepFollower(m Message) error {
 
 	switch m.MsgType {
@@ -237,7 +278,6 @@ func (r *Replica) stepFollower(m Message) error {
 		r.electionElapsed = 0
 		if r.leader == None {
 			r.becomeFollower(m.Term, m.From)
-
 		}
 
 		if m.ConfVersion > r.cfg.Version { // 如果本地配置版本小于领导的配置版本，那么请求领导的配置
@@ -250,10 +290,9 @@ func (r *Replica) stepFollower(m Message) error {
 		r.updateFollowCommittedIndex(m.CommittedIndex) // 更新提交索引
 	case MsgLogConflictCheckResp: // 日志冲突检查返回
 		if !m.Reject {
-			// r.Info("follower: truncate log to", zap.Uint64("leader", r.leader), zap.Uint32("term", r.term), zap.Uint64("index", m.Index), zap.Uint64("lastIndex", r.replicaLog.lastLogIndex))
 			r.status = StatusReady
-			r.logConflictCheckTick = r.opts.RequestTimeoutTick // 可以进行下次请求
-
+			r.coflictCheckState.ProcessSuccess()
+			// r.Info("follower: truncate log to", zap.Uint64("leader", r.leader), zap.Uint32("term", r.term), zap.Uint64("index", m.Index), zap.Uint64("lastIndex", r.replicaLog.lastLogIndex))
 			if m.Index != NoConflict && m.Index > 0 {
 				truncateLogIndex := m.Index
 				if truncateLogIndex > r.replicaLog.lastLogIndex+1 {
@@ -265,31 +304,39 @@ func (r *Replica) stepFollower(m Message) error {
 				}
 				r.replicaLog.updateLastIndex(truncateLogIndex - 1)
 			}
+
+		} else {
+			r.coflictCheckState.ProcessFail()
 		}
 
 	case MsgSyncResp: // 同步日志返回
-		r.syncing = false
-		r.electionElapsed = 0
-		if m.Reject {
-			return nil
-		}
+		r.electionElapsed = 0 // 重置选举计时器
 		// 设置同步速度
 		r.setSpeedLevel(m.SpeedLevel)
-		// 如果有同步到日志，则追加到本地，并立马进行下次同步
-		if len(m.Logs) > 0 {
-			r.syncTick = r.syncIntervalTick // 表示无需等待立马进行下次同步
-			if m.Logs[len(m.Logs)-1].Index <= r.replicaLog.lastLogIndex {
-				r.Warn("log exist, no append", zap.Uint64("syncIndex", m.Index), zap.Uint64("leader", r.leader), zap.Uint64("maxLogIndex", m.Logs[len(m.Logs)-1].Index), zap.Uint64("localLastLogIndex", r.replicaLog.lastLogIndex))
-				return nil
-			}
-			if !r.appendLog(m.Logs...) {
-				return ErrProposalDropped
-			}
-
-		} else {
-			r.syncTick = 0
+		if r.detailLogOn {
+			r.Info("sync resp", zap.Uint64("from", m.From), zap.Int("logs", len(m.Logs)), zap.Uint64("syncIndex", m.Index))
 		}
-		r.updateFollowCommittedIndex(m.CommittedIndex) // 更新提交索引
+
+		if !m.Reject {
+			r.syncState.ProcessSuccess()
+			// 如果有同步到日志，则追加到本地，并立马进行下次同步
+			if len(m.Logs) > 0 {
+				r.syncState.Immediately() // 下次立即同步
+
+				if m.Logs[len(m.Logs)-1].Index <= r.replicaLog.lastLogIndex {
+					r.Warn("log exist, no append", zap.Uint64("syncIndex", m.Index), zap.Uint64("leader", r.leader), zap.Uint64("maxLogIndex", m.Logs[len(m.Logs)-1].Index), zap.Uint64("localLastLogIndex", r.replicaLog.lastLogIndex))
+					return nil
+				}
+				if !r.appendLog(m.Logs...) {
+					return ErrProposalDropped
+				}
+			} else {
+				r.syncState.Delay() // 推迟同步
+			}
+			r.updateFollowCommittedIndex(m.CommittedIndex) // 更新提交索引
+		} else {
+			r.syncState.ProcessFail()
+		}
 
 	}
 	return nil
@@ -311,14 +358,11 @@ func (r *Replica) stepLearner(m Message) error {
 		r.setSpeedLevel(m.SpeedLevel) // 设置同步速度
 		r.send(r.newPong(m.From))
 	case MsgLogConflictCheckResp: // 日志冲突检查返回
-		if m.Reject {
-			r.status = StatusLogCoflictCheck
-		} else {
+		if !m.Reject {
+			r.coflictCheckState.ProcessSuccess()
+
 			r.Info("learner: truncate log to", zap.Uint64("leader", r.leader), zap.Uint32("term", r.term), zap.Uint64("index", m.Index), zap.Uint64("lastIndex", r.replicaLog.lastLogIndex))
-			r.status = StatusReady
-
 			if m.Index != NoConflict && m.Index > 0 {
-
 				truncateLogIndex := m.Index
 				if truncateLogIndex > r.replicaLog.lastLogIndex+1 {
 					truncateLogIndex = r.replicaLog.lastLogIndex + 1
@@ -329,26 +373,35 @@ func (r *Replica) stepLearner(m Message) error {
 				}
 				r.replicaLog.updateLastIndex(truncateLogIndex - 1)
 			}
+			r.status = StatusReady
+		} else {
+			r.coflictCheckState.willRetry = true
 		}
 	case MsgSyncResp: // 同步日志返回
-		r.syncing = false
 		r.electionElapsed = 0
 		// 设置同步速度
 		r.setSpeedLevel(m.SpeedLevel)
-		// 如果有同步到日志，则追加到本地，并立马进行下次同步
-		if len(m.Logs) > 0 {
-			r.syncTick = r.syncIntervalTick // 表示无需等待立马进行下次同步
-			if m.Logs[len(m.Logs)-1].Index <= r.replicaLog.lastLogIndex {
-				r.Warn("learner: log exist, no append", zap.Uint64("syncIndex", m.Index), zap.Uint64("leader", r.leader), zap.Uint64("maxLogIndex", m.Logs[len(m.Logs)-1].Index), zap.Uint64("localLastLogIndex", r.replicaLog.lastLogIndex))
-				return nil
+
+		if !m.Reject {
+			r.syncState.ProcessSuccess()
+			// 如果有同步到日志，则追加到本地，并立马进行下次同步
+			if len(m.Logs) > 0 {
+				r.syncState.Immediately()
+				if m.Logs[len(m.Logs)-1].Index <= r.replicaLog.lastLogIndex {
+					r.Warn("learner: log exist, no append", zap.Uint64("syncIndex", m.Index), zap.Uint64("leader", r.leader), zap.Uint64("maxLogIndex", m.Logs[len(m.Logs)-1].Index), zap.Uint64("localLastLogIndex", r.replicaLog.lastLogIndex))
+					return nil
+				}
+				if !r.appendLog(m.Logs...) {
+					return ErrProposalDropped
+				}
+			} else {
+				r.syncState.Delay()
 			}
-			if !r.appendLog(m.Logs...) {
-				return ErrProposalDropped
-			}
+			r.updateFollowCommittedIndex(m.CommittedIndex) // 更新提交索引
 		} else {
-			r.syncTick = 0
+			r.syncState.ProcessFail()
 		}
-		r.updateFollowCommittedIndex(m.CommittedIndex) // 更新提交索引
+
 	}
 
 	return nil

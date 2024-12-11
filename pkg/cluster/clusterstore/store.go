@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/keylock"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
@@ -22,6 +23,8 @@ type Store struct {
 	messageShardLogStorage *MessageShardLogStorage
 
 	stopper *syncutil.Stopper
+
+	applyC chan applyReq
 }
 
 func NewStore(opts *Options) *Store {
@@ -32,6 +35,7 @@ func NewStore(opts *Options) *Store {
 		Log:     wklog.NewWKLog(fmt.Sprintf("clusterStore[%d]", opts.NodeID)),
 		lock:    keylock.NewKeyLock(),
 		stopper: syncutil.NewStopper(),
+		applyC:  make(chan applyReq, 1000),
 	}
 
 	err := os.MkdirAll(opts.DataDir, os.ModePerm)
@@ -55,6 +59,11 @@ func NewStore(opts *Options) *Store {
 }
 
 func (s *Store) Open() error {
+
+	for i := 0; i < 1; i++ { // 这里不能开启多个applyLoop，否则会导致数据不一致
+		s.stopper.RunWorker(s.applyLoop)
+	}
+
 	s.lock.StartCleanLoop()
 	err := s.wdb.Open()
 	if err != nil {
@@ -107,7 +116,7 @@ func (s *Store) AddSystemUids(uids []string) error {
 		return err
 	}
 	var slotId uint32 = 0 // 系统uid默认存储在slot 0上
-	_, err = s.opts.Cluster.ProposeDataToSlot(s.ctx, slotId, cmdData)
+	_, err = s.opts.Cluster.ProposeDataToSlot(slotId, cmdData)
 	return err
 }
 
@@ -119,7 +128,7 @@ func (s *Store) RemoveSystemUids(uids []string) error {
 		return err
 	}
 	var slotId uint32 = 0 // 系统uid默认存储在slot 0上
-	_, err = s.opts.Cluster.ProposeDataToSlot(s.ctx, slotId, cmdData)
+	_, err = s.opts.Cluster.ProposeDataToSlot(slotId, cmdData)
 	return err
 }
 
@@ -140,4 +149,8 @@ func (s *Store) AddIPBlacklist(ips []string) error {
 
 func (s *Store) DB() wkdb.DB {
 	return s.wdb
+}
+
+func (s *Store) WithTimeout() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(s.ctx, time.Second*10)
 }

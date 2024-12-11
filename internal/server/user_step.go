@@ -19,7 +19,7 @@ func (u *userHandler) step(a UserAction) error {
 	switch a.ActionType {
 	case UserActionInitResp: // 初始化返回
 		if a.Reason == ReasonSuccess {
-			u.initTick = u.opts.Reactor.User.ProcessIntervalTick // 立即处理下个逻辑
+			u.initState.ProcessSuccess()
 			u.status = userStatusInitialized
 			u.leaderId = a.LeaderId
 			if a.LeaderId == u.sub.r.s.opts.Cluster.NodeId {
@@ -28,9 +28,8 @@ func (u *userHandler) step(a UserAction) error {
 				u.becomeProxy(a.LeaderId)
 			}
 		} else {
-			u.status = userStatusUninitialized
+			u.initState.ProcessFail()
 		}
-		u.Info("init finished")
 	case UserActionLeaderChange:
 		u.leaderId = a.LeaderId
 		if u.role == userRoleLeader { // 当前节点是leader
@@ -45,7 +44,7 @@ func (u *userHandler) step(a UserAction) error {
 	case UserActionConnect: // 连接
 		for _, msg := range a.Messages {
 			msg.Index = u.authQueue.lastIndex + 1
-			u.Info("add auth message...", zap.Uint64("index", msg.Index))
+			u.Debug("add auth message...", zap.Uint64("index", msg.Index))
 			u.authQueue.appendMessage(msg)
 		}
 
@@ -53,23 +52,18 @@ func (u *userHandler) step(a UserAction) error {
 		for _, msg := range a.Messages {
 			msg.Index = u.recvMsgQueue.lastIndex + 1
 			u.recvMsgQueue.appendMessage(msg)
-			// if msg.InPacket != nil {
-			// 	u.Info("recv...", zap.String("frameType", msg.InPacket.GetFrameType().String()))
-			// } else {
-			// 	u.Info("recv...", zap.Int("size", len(msg.OutBytes)))
-			// }
 
 		}
 
 	case UserActionRecvResp: // 收消息返回
 		if a.Reason == ReasonSuccess {
-			u.recvMsgTick = 0
-			u.recvMsging = false
-		}
-
-		if a.Reason == ReasonSuccess && u.recvMsgQueue.processingIndex < a.Index {
-			u.recvMsgQueue.processingIndex = a.Index
-			u.recvMsgQueue.truncateTo(a.Index)
+			u.recvMsgState.ProcessSuccess()
+			if u.recvMsgQueue.processingIndex < a.Index {
+				u.recvMsgQueue.processingIndex = a.Index
+				u.recvMsgQueue.truncateTo(a.Index)
+			}
+		} else {
+			u.recvMsgState.ProcessFail()
 		}
 		// u.Info("recv resp...")
 
@@ -89,17 +83,15 @@ func (u *userHandler) step(a UserAction) error {
 
 func (u *userHandler) stepLeader(a UserAction) error {
 	switch a.ActionType {
-
 	case UserActionAuthResp:
-		u.authing = false
 		if a.Reason == ReasonSuccess {
-			u.authing = false
-			u.authTick = 0
-		}
-		if a.Reason == ReasonSuccess && u.authQueue.processingIndex < a.Index {
-			u.authQueue.processingIndex = a.Index
-			u.Info("auth resp...", zap.Uint64("index", a.Index))
-			u.authQueue.truncateTo(a.Index)
+			u.authState.ProcessSuccess()
+			if u.authQueue.processingIndex < a.Index {
+				u.authQueue.processingIndex = a.Index
+				u.authQueue.truncateTo(a.Index)
+			}
+		} else {
+			u.authState.ProcessFail()
 		}
 		// u.Info("auth resp...")
 	case UserActionSend: // 发送消息
@@ -119,24 +111,25 @@ func (u *userHandler) stepLeader(a UserAction) error {
 		}
 
 	case UserActionPingResp: // ping处理返回
-		u.sendPing = false
-		if a.Reason == ReasonSuccess && u.pingQueue.processingIndex < a.Index {
-			u.pingQueue.processingIndex = a.Index
-			u.pingQueue.truncateTo(a.Index)
-		}
-	// u.Info("ping resp...")
-	case UserActionRecvackResp: // recvack处理返回
-		u.sendRecvacking = false
 		if a.Reason == ReasonSuccess {
-			u.sendRecvackTick = 0
-			u.sendRecvacking = false
+			u.pingState.ProcessSuccess()
+			if u.pingQueue.processingIndex < a.Index {
+				u.pingQueue.processingIndex = a.Index
+				u.pingQueue.truncateTo(a.Index)
+			}
+		} else {
+			u.pingState.ProcessFail()
 		}
-
-		if a.Reason == ReasonSuccess && u.recvackQueue.processingIndex < a.Index {
-			u.recvackQueue.processingIndex = a.Index
-			u.recvackQueue.truncateTo(a.Index)
+	case UserActionRecvackResp: // recvack处理返回
+		if a.Reason == ReasonSuccess {
+			u.recvackState.ProcessSuccess()
+			if u.recvackQueue.processingIndex < a.Index {
+				u.recvackQueue.processingIndex = a.Index
+				u.recvackQueue.truncateTo(a.Index)
+			}
+		} else {
+			u.recvackState.ProcessFail()
 		}
-		// u.Info("recvack resp...")
 
 	case UserActionNodePong: // 追随者pong
 		for _, msg := range a.Messages {
@@ -183,21 +176,23 @@ func (u *userHandler) stepProxy(a UserAction) error {
 	case UserActionForwardResp: // 转发recvack处理返回
 		if a.Forward.ActionType == UserActionSend {
 			if a.Reason == ReasonSuccess {
-				u.sendRecvackTick = 0
-				u.sendRecvacking = false
+				u.recvackState.ProcessSuccess()
 				if u.recvackQueue.processingIndex < a.Index {
 					u.recvackQueue.processingIndex = a.Index
 					u.recvackQueue.truncateTo(a.Index)
 				}
+			} else {
+				u.recvackState.ProcessFail()
 			}
 		} else if a.Forward.ActionType == UserActionConnect {
 			if a.Reason == ReasonSuccess {
-				u.authTick = 0
-				u.authing = false
+				u.authState.ProcessSuccess()
 				if u.authQueue.processingIndex < a.Index {
 					u.authQueue.processingIndex = a.Index
 					u.authQueue.truncateTo(a.Index)
 				}
+			} else {
+				u.authState.ProcessFail()
 			}
 		}
 

@@ -14,17 +14,12 @@ type replicaLog struct {
 
 	lastLogIndex uint64 // 最后一条日志下标
 
-	storagingIndex uint64 // 正在存储中的日志下标
-	storagedIndex  uint64 // 已存储的日志下标
+	storagedIndex uint64 // 已存储的日志下标
 
 	committedIndex uint64 // 已提交的日志下标
 
-	applyingIndex uint64 // 正在应用的日志下标
-
 	appliedIndex uint64 // 已应用的日志下标
 
-	storaging bool // 是否正在追加日志
-	applying  bool // 是否正在应用日志
 }
 
 func newReplicaLog(opts *Options) *replicaLog {
@@ -47,7 +42,6 @@ func newReplicaLog(opts *Options) *replicaLog {
 
 	rg.committedIndex = opts.AppliedIndex
 	rg.appliedIndex = opts.AppliedIndex
-	rg.applyingIndex = opts.AppliedIndex
 
 	rg.updateLastIndex(lastIndex)
 
@@ -57,9 +51,8 @@ func newReplicaLog(opts *Options) *replicaLog {
 func (r *replicaLog) updateLastIndex(lastIndex uint64) {
 	r.lastLogIndex = lastIndex
 	r.storagedIndex = lastIndex
-	r.storagingIndex = lastIndex
-	r.unstable.offset = lastIndex + 1
-	r.unstable.offsetInProgress = lastIndex + 1
+	r.unstable.offset = lastIndex
+	r.unstable.offsetInProgress = lastIndex
 
 	if r.committedIndex > lastIndex {
 		r.committedIndex = lastIndex
@@ -78,76 +71,47 @@ func (r *replicaLog) appendLog(logs ...Log) {
 
 }
 
-func (r *replicaLog) storagingTo(index uint64) {
-	r.storagingIndex = index
-	r.storaging = true
-}
-
 func (r *replicaLog) storagedTo(index uint64) {
-	r.storagedIndex = index
-	r.storagingIndex = index
-	r.storaging = false
-}
-
-// 是否有需要存储的日志
-func (r *replicaLog) hasStorage() bool {
-	if r.storaging {
-		return false
+	if index < r.storagedIndex || index > r.lastLogIndex {
+		r.Panic("storagedTo index out of bound", zap.Uint64("index", index), zap.Uint64("storagedIndex", r.storagedIndex), zap.Uint64("lastLogIndex", r.lastLogIndex))
 	}
-	return r.storagingIndex < r.lastLogIndex
+	r.storagedIndex = index
+	// r.Info("storagedTo--------->", zap.Uint64("index", index))
 }
 
 // 需要存储的日志
 func (r *replicaLog) nextStorageLogs() []Log {
-	if r.storagingIndex >= r.lastLogIndex {
+	if r.storagedIndex >= r.lastLogIndex {
 		return nil
 	}
 
-	return r.unstable.slice(r.storagingIndex+1, r.lastLogIndex+1)
-}
-
-// 是否有需要应用的日志
-func (r *replicaLog) hasApply() bool {
-	if r.applying {
-		return false
-	}
-	i := min(r.storagedIndex, r.committedIndex)
-	return r.applyingIndex < i
-}
-
-func (r *replicaLog) committedTo(index uint64) {
-	if index < r.committedIndex {
-		r.Panic("commit index less than committed index", zap.Uint64("commitIndex", index), zap.Uint64("committedIndex", r.committedIndex))
-	}
-	r.committedIndex = index
-}
-
-func (r *replicaLog) applyingTo(index uint64) {
-	if index < r.applyingIndex {
-		r.Panic("apply index less than applying index", zap.Uint64("applyIndex", index), zap.Uint64("applyingIndex", r.applyingIndex))
-	}
-	r.applyingIndex = index
-	r.applying = true
+	return r.unstable.slice(r.unstable.offsetIndex(r.storagedIndex+1), r.unstable.offsetIndex(r.lastLogIndex+1))
 }
 
 func (r *replicaLog) appliedTo(i uint64) {
+	if i < r.appliedIndex {
+		r.Warn("applied index less than appliedIndex", zap.Uint64("i", i), zap.Uint64("appliedIndex", r.appliedIndex))
+		return
+	}
 	r.appliedIndex = i
-	r.applyingIndex = i
-	r.applying = false
+
 	r.unstable.appliedTo(i)
 }
 
-func (r *replicaLog) getLogsFromUnstable(lo, hi uint64, maxSize logEncodingSize) ([]Log, bool, error) {
-	if err := r.mustCheckOutOfBounds(lo, hi); err != nil {
-		return nil, false, err
-	}
+func (r *replicaLog) getLogsFromUnstable(startLogIndex, endLogIndex uint64, maxSize logEncodingSize) ([]Log, bool, error) {
+	lo := r.unstable.offsetIndex(startLogIndex)
+	hi := r.unstable.offsetIndex(endLogIndex)
 	if lo == hi {
+		return nil, false, nil
+	}
+	if len(r.unstable.logs) == 0 {
 		return nil, false, nil
 	}
 	if lo >= r.unstable.offset {
 		logs, exceed := limitSize(r.unstable.slice(lo, hi), maxSize)
 		return logs[:len(logs):len(logs)], exceed, nil
 	}
+
 	return nil, false, nil
 }
 
@@ -158,7 +122,7 @@ func (r *replicaLog) mustCheckOutOfBounds(lo, hi uint64) error {
 	}
 	fi := r.firstIndex()
 	if lo < fi {
-		r.Error("mustCheckOutOfBounds err", zap.Uint64("lo", lo), zap.Uint64("firstIndex", fi))
+		r.Panic("mustCheckOutOfBounds err", zap.Uint64("lo", lo), zap.Uint64("firstIndex", fi))
 		return ErrCompacted
 	}
 

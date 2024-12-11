@@ -9,6 +9,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 	"github.com/lni/goutils/syncutil"
+	"github.com/valyala/fastrand"
 	"go.uber.org/zap"
 )
 
@@ -47,7 +48,10 @@ func (u *userReactorSub) stop() {
 }
 
 func (u *userReactorSub) loop() {
-	tk := time.NewTicker(u.r.s.opts.Reactor.User.TickInterval)
+	p := float64(fastrand.Uint32()) / (1 << 32)
+	// 以避免系统中因定时器、周期性任务或请求间隔完全一致而导致的同步问题（例如拥堵或资源竞争）。
+	jitter := time.Duration(p * float64(u.r.s.opts.Reactor.User.TickInterval/2))
+	tk := time.NewTicker(u.r.s.opts.Reactor.User.TickInterval + jitter)
 	defer tk.Stop()
 	for {
 		u.readys()
@@ -103,9 +107,9 @@ func (u *userReactorSub) stepNoWait(uid string, action UserAction) error {
 	return nil
 }
 
-func (u *userReactorSub) proposeSend(conn *connContext, messageId int64, sendPacket *wkproto.SendPacket) error {
+func (u *userReactorSub) proposeSend(conn *connContext, messageId int64, sendPacket *wkproto.SendPacket, wait bool) error {
 
-	return u.r.s.channelReactor.proposeSend(messageId, conn.uid, conn.deviceId, conn.connId, u.r.s.opts.Cluster.NodeId, true, sendPacket)
+	return u.r.s.channelReactor.proposeSend(messageId, conn.uid, conn.deviceId, conn.connId, u.r.s.opts.Cluster.NodeId, true, sendPacket, wait)
 }
 
 func (u *userReactorSub) stepWait(uid string, action UserAction) error {
@@ -152,30 +156,35 @@ func (u *userReactorSub) handleReady(uh *userHandler) {
 			u.r.addInitReq(&userInitReq{
 				uniqueNo: action.UniqueNo,
 				uid:      uh.uid,
+				sub:      u,
 			})
 		case UserActionAuth: // 用户连接认证请求
 			u.r.addAuthReq(&userAuthReq{
 				uniqueNo: action.UniqueNo,
 				uid:      uh.uid,
 				messages: action.Messages,
+				sub:      u,
 			})
 		case UserActionPing: // 用户发送ping
 			u.r.addPingReq(&pingReq{
 				uniqueNo: action.UniqueNo,
 				uid:      uh.uid,
 				messages: action.Messages,
+				sub:      u,
 			})
 		case UserActionRecvack: // 用户发送recvack
 			u.r.addRecvackReq(&recvackReq{
 				uniqueNo: action.UniqueNo,
 				uid:      uh.uid,
 				messages: action.Messages,
+				sub:      u,
 			})
 		case UserActionRecv: // 用户接受消息
 			u.r.addWriteReq(&writeReq{
 				uniqueNo: action.UniqueNo,
 				uid:      uh.uid,
 				messages: action.Messages,
+				sub:      u,
 			})
 		case UserActionForward: // 转发action
 			u.r.addForwardUserActionReq(action)
@@ -211,6 +220,7 @@ func (u *userReactorSub) handleReady(uh *userHandler) {
 				uid:      uh.uid,
 				uniqueNo: action.UniqueNo,
 				leaderId: leaderId,
+				sub:      u,
 			})
 
 		default:
@@ -246,6 +256,17 @@ func (u *userReactorSub) addUserHandlerIfNotExist(h *userHandler) {
 	if u.getUserHandler(h.uid) == nil {
 		u.addUserHandler(h)
 	}
+}
+
+func (u *userReactorSub) addOrCreateUserHandlerIfNotExist(uid string) *userHandler {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	handler := u.getUserHandler(uid)
+	if handler == nil {
+		handler = newUserHandler(uid, u)
+		u.addUserHandler(handler)
+	}
+	return handler
 }
 
 func (u *userReactorSub) addConnAndCreateUserHandlerIfNotExist(conn *connContext) {

@@ -107,7 +107,7 @@ func NewOptions(opt ...Option) *Options {
 		SlotMaxReplicaCount:        3,
 		DataDir:                    "clusterdata",
 		ReqTimeout:                 10 * time.Second,
-		ProposeTimeout:             10 * time.Second,
+		ProposeTimeout:             5 * time.Minute,
 		SendQueueLength:            1024 * 10,
 		MaxMessageBatchSize:        64 * 1024 * 1024, // 64M
 		ReceiveQueueLength:         1024,
@@ -115,7 +115,7 @@ func NewOptions(opt ...Option) *Options {
 		InitialTaskQueueCap:        24,
 		LogSyncLimitSizeOfEach:     1024 * 1024 * 20, // 20M
 		Addr:                       "tcp://127.0.0.1:11110",
-		ChannelElectionPoolSize:    10,
+		ChannelElectionPoolSize:    1000,
 		MaxChannelElectionBatchLen: 100,
 		ChannelMaxReplicaCount:     3,
 		ChannelLoadPoolSize:        1000,

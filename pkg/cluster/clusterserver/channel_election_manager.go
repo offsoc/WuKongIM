@@ -24,7 +24,7 @@ type channelElectionManager struct {
 
 func newChannelElectionManager(s *Server) *channelElectionManager {
 	return &channelElectionManager{
-		electionC: make(chan electionReq, 1000),
+		electionC: make(chan electionReq, 4096),
 		stopper:   syncutil.NewStopper(),
 		opts:      s.opts,
 		s:         s,
@@ -87,7 +87,6 @@ func (c *channelElectionManager) loop() {
 
 // 添加选举请求
 func (c *channelElectionManager) addElectionReq(req electionReq) error {
-	c.Info("addElectionReq....", zap.String("channelId", req.cfg.ChannelId), zap.Uint8("channelType", req.cfg.ChannelType))
 	select {
 	case c.electionC <- req:
 	case <-c.stopper.ShouldStop():
@@ -102,11 +101,11 @@ func (c *channelElectionManager) election(reqs []electionReq) {
 
 	start := time.Now()
 	defer func() {
-		c.Info("channel election", zap.Duration("cost", time.Since(start)), zap.Int("num", len(reqs)))
+		c.Foucs("channel election", zap.Duration("cost", time.Since(start)), zap.Int("num", len(reqs)))
 	}()
 	channelLastLogInfoMap, err := c.requestChannelLastLogInfos(reqs)
 	if err != nil {
-		c.Error("requestChannelLastLogInfos failed", zap.Error(err))
+		c.Foucs("requestChannelLastLogInfos failed", zap.Error(err))
 		for _, req := range reqs {
 			req.resultC <- electionResp{
 				err: err,
@@ -127,7 +126,7 @@ func (c *channelElectionManager) election(reqs []electionReq) {
 			}
 		}
 		if len(lastInfoResps) < c.quorum() { // 如果参与选举的节点数小于法定数量，则直接返回错误
-			c.Error("not enough replicas", zap.Int("num", len(lastInfoResps)), zap.Int("lastLogInfoNum", len(channelLastLogInfoMap)), zap.Int("quorum", c.quorum()))
+			c.Foucs("not enough replicas", zap.Int("num", len(lastInfoResps)), zap.Int("lastLogInfoNum", len(channelLastLogInfoMap)), zap.Int("quorum", c.quorum()))
 			select {
 			case req.resultC <- electionResp{
 				err: ErrNotEnoughReplicas,

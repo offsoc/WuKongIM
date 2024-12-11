@@ -19,10 +19,9 @@ import (
 )
 
 type node struct {
-	id              uint64
-	addr            string
-	client          *client.Client
-	activityTimeout time.Duration // 活动超时时间，如果这个时间内没有活动，就表示节点已下线
+	id     uint64
+	addr   string
+	client *client.Client
 
 	breaker             *circuit.Breaker
 	sendQueue           sendQueue
@@ -38,7 +37,6 @@ func newNode(id uint64, uid string, addr string, opts *Options) *node {
 		id:                  id,
 		addr:                addr,
 		opts:                opts,
-		activityTimeout:     time.Minute * 2, // TODO: 这个时间也不能太短，如果太短节点可能在启动中，这时可能认为下线了，导致触发领导的转移
 		breaker:             netutil.NewBreaker(),
 		stopper:             syncutil.NewStopper(),
 		maxMessageBatchSize: opts.MaxMessageBatchSize,
@@ -48,32 +46,28 @@ func newNode(id uint64, uid string, addr string, opts *Options) *node {
 			rl: NewRateLimiter(opts.MaxSendQueueSize),
 		},
 	}
-	n.client = client.New(addr, client.WithUID(uid), client.WithOnConnectStatus(n.connectStatusChange), client.WithRequestTimeout(opts.ReqTimeout))
+	n.client = client.New(addr, client.WithUid(uid))
 	return n
-}
-
-func (n *node) connectStatusChange(status client.ConnectStatus) {
-	// n.Debug("节点连接状态改变", zap.String("status", status.String()))
 }
 
 func (n *node) start() {
 	n.stopper.RunWorker(n.processMessages)
 
-	n.client.SetActivity(time.Now())
-	n.client.Start()
+	err := n.client.Start()
+	if err != nil {
+		n.Panic("client start failed", zap.Error(err))
+	}
 
 }
 
 func (n *node) stop() {
-	n.Debug("close")
 	n.stopper.Stop()
-	n.Debug("close1")
-	n.client.Close()
-	n.Debug("close2")
+	n.client.Stop()
 }
 
 func (n *node) send(msg *proto.Message) error {
 	if !n.breaker.Ready() { // 断路器，防止雪崩
+		n.Error("circuit breaker is not ready")
 		return errCircuitBreakerNotReady
 	}
 	if n.sendQueue.rateLimited() { // 发送队列限流
@@ -87,9 +81,22 @@ func (n *node) send(msg *proto.Message) error {
 		return nil
 	default:
 		n.sendQueue.decrease(msg)
-		n.Error("sendQueue is full", zap.Int("length", len(n.sendQueue.ch)))
+		n.Error("sendQueue is full", zap.Int("length", len(n.sendQueue.ch)), zap.Uint32("msgType", msg.MsgType))
 		return errChanIsFull
 	}
+}
+
+// 请求中的数量
+func (n *node) requesting() int64 {
+	if n.client != nil {
+		return n.client.Requesting.Load()
+	}
+	return 0
+}
+
+// 消息发送中的数量
+func (n *node) sending() int64 {
+	return n.sendQueue.count.Load()
 }
 
 func (n *node) processMessages() {
@@ -101,8 +108,12 @@ func (n *node) processMessages() {
 		select {
 		case msg := <-n.sendQueue.ch:
 
-			if n.client.ConnectStatus() != client.CONNECTED {
+			if !n.client.IsAuthed() {
 				continue
+			}
+
+			if n.client.Options().LogDetailOn {
+				n.Info("send message", zap.Uint32("msgType", msg.MsgType))
 			}
 
 			n.sendQueue.decrease(msg)
@@ -125,7 +136,7 @@ func (n *node) processMessages() {
 			trace.GlobalTrace.Metrics.System().IntranetOutgoingAdd(int64(size))
 
 			if err = n.sendBatch(msgs); err != nil {
-				if n.client.ConnectStatus() == client.CONNECTED { // 只有连接状态下才打印错误日志
+				if n.client.IsAuthed() { // 只有连接状态下才打印错误日志
 					n.Error("sendBatch is failed", zap.Error(err))
 				}
 			}
@@ -139,7 +150,12 @@ func (n *node) processMessages() {
 }
 
 func (n *node) sendBatch(msgs []*proto.Message) error {
-	return n.client.SendBatch(msgs)
+	for _, msg := range msgs {
+		if err := n.client.Send(msg); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (n *node) requestWithContext(ctx context.Context, path string, body []byte) (*proto.Response, error) {
@@ -156,7 +172,7 @@ func (n *node) requestChannelLastLogInfo(ctx context.Context, req ChannelLastLog
 	if err != nil {
 		return nil, err
 	}
-	if resp.Status != proto.Status_OK {
+	if resp.Status != proto.StatusOK {
 		return nil, fmt.Errorf("requestChannelLastLogInfo is failed, status:%d", resp.Status)
 	}
 	channelLastLogInfoResp := ChannelLastLogInfoResponseSet{}
@@ -176,7 +192,7 @@ func (n *node) requestChannelClusterConfig(ctx context.Context, req *ChannelClus
 	if err != nil {
 		return wkdb.EmptyChannelClusterConfig, err
 	}
-	if resp.Status != proto.Status_OK {
+	if resp.Status != proto.StatusOK {
 		return wkdb.EmptyChannelClusterConfig, fmt.Errorf("requestChannelClusterConfig is failed,nodeId: %d status:%d err:%s", n.id, resp.Status, []byte(resp.Body))
 	}
 	channelClusterConfigResp := wkdb.ChannelClusterConfig{}
@@ -196,7 +212,7 @@ func (n *node) requestChannelProposeMessage(ctx context.Context, req *ChannelPro
 	if err != nil {
 		return nil, err
 	}
-	if resp.Status != proto.Status_OK {
+	if resp.Status != proto.StatusOK {
 		if len(resp.Body) > 0 {
 			return nil, errors.New(string(resp.Body))
 		}
@@ -219,7 +235,7 @@ func (n *node) requestSlotLogInfo(ctx context.Context, req *SlotLogInfoReq) (*Sl
 	if err != nil {
 		return nil, err
 	}
-	if resp.Status != proto.Status_OK {
+	if resp.Status != proto.StatusOK {
 		return nil, fmt.Errorf("requestSlotLogInfo is failed, status:%d", resp.Status)
 	}
 	slotLogInfoResp := &SlotLogInfoResp{}
@@ -240,7 +256,7 @@ func (n *node) requestSlotPropose(ctx context.Context, req *SlotProposeReq) (*Sl
 	if err != nil {
 		return nil, err
 	}
-	if resp.Status != proto.Status_OK {
+	if resp.Status != proto.StatusOK {
 		return nil, fmt.Errorf("requestSlotPropose is failed, status:%d", resp.Status)
 	}
 	proposeMessageResp := &SlotProposeResp{}
@@ -260,7 +276,7 @@ func (n *node) requestClusterJoin(ctx context.Context, req *ClusterJoinReq) (*Cl
 	if err != nil {
 		return nil, err
 	}
-	if resp.Status != proto.Status_OK {
+	if resp.Status != proto.StatusOK {
 		return nil, fmt.Errorf("requestClusterJoin is failed, status:%d", resp.Status)
 	}
 	clusterJoinResp := &ClusterJoinResp{}

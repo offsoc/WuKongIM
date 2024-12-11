@@ -20,8 +20,13 @@ import (
 func (r *userReactor) addInitReq(req *userInitReq) {
 	select {
 	case r.processInitC <- req:
-	case <-r.stopper.ShouldStop():
-		return
+	default:
+		r.Warn("addInitReq: processInitC is full, ignore ", zap.String("uid", req.uid))
+		req.sub.step(req.uid, UserAction{
+			UniqueNo:   req.uniqueNo,
+			ActionType: UserActionInitResp,
+			Reason:     ReasonError,
+		})
 	}
 }
 
@@ -50,7 +55,7 @@ func (r *userReactor) processInit(req *userInitReq) {
 		r.s.trace.Metrics.App().OnlineUserCountAdd(1)
 	}
 
-	r.reactorSub(req.uid).step(req.uid, UserAction{
+	req.sub.step(req.uid, UserAction{
 		UniqueNo:   req.uniqueNo,
 		ActionType: UserActionInitResp,
 		LeaderId:   leaderId,
@@ -61,6 +66,7 @@ func (r *userReactor) processInit(req *userInitReq) {
 type userInitReq struct {
 	uniqueNo string
 	uid      string
+	sub      *userReactorSub
 }
 
 // =================================== auth ===================================
@@ -68,8 +74,13 @@ type userInitReq struct {
 func (r *userReactor) addAuthReq(req *userAuthReq) {
 	select {
 	case r.processAuthC <- req:
-	case <-r.stopper.ShouldStop():
-		return
+	default:
+		r.Warn("addAuthReq: processAuthC is full, ignore ", zap.String("uid", req.uid), zap.Int("msgCount", len(req.messages)))
+		req.sub.step(req.uid, UserAction{
+			UniqueNo:   req.uniqueNo,
+			ActionType: UserActionAuthResp,
+			Reason:     ReasonError,
+		})
 	}
 }
 
@@ -99,6 +110,7 @@ func (r *userReactor) processAuthLoop() {
 }
 
 func (r *userReactor) processAuths(reqs []*userAuthReq) {
+
 	timeoutCtx, cancel := context.WithTimeout(r.s.ctx, time.Second*10)
 	defer cancel()
 	errgroup, _ := errgroup.WithContext(timeoutCtx)
@@ -120,7 +132,7 @@ func (r *userReactor) processAuth(req *userAuthReq) {
 		_, _ = r.handleAuth(req.uid, msg)
 	}
 	lastIndex := req.messages[len(req.messages)-1].Index
-	r.reactorSub(req.uid).step(req.uid, UserAction{
+	req.sub.step(req.uid, UserAction{
 		UniqueNo:   req.uniqueNo,
 		ActionType: UserActionAuthResp,
 		Reason:     ReasonSuccess,
@@ -288,7 +300,7 @@ func (r *userReactor) handleAuth(uid string, msg ReactorUserMessage) (wkproto.Re
 
 	r.Debug("auth: auth Success", zap.Any("conn", connCtx), zap.Uint8("protoVersion", connectPacket.Version), zap.Bool("hasServerVersion", hasServerVersion))
 	connack := &wkproto.ConnackPacket{
-		Salt:          aesIV,
+		Salt:          string(aesIV),
 		ServerKey:     dhServerPublicKeyEnc,
 		ReasonCode:    wkproto.ReasonSuccess,
 		TimeDiff:      timeDiff,
@@ -308,11 +320,11 @@ func (r *userReactor) handleAuth(uid string, msg ReactorUserMessage) (wkproto.Re
 
 // 获取客户端的aesKey和aesIV
 // dhServerPrivKey  服务端私钥
-func (r *userReactor) getClientAesKeyAndIV(clientKey string, dhServerPrivKey [32]byte) (string, string, error) {
+func (r *userReactor) getClientAesKeyAndIV(clientKey string, dhServerPrivKey [32]byte) ([]byte, []byte, error) {
 
 	clientKeyBytes, err := base64.StdEncoding.DecodeString(clientKey)
 	if err != nil {
-		return "", "", err
+		return nil, nil, err
 	}
 
 	var dhClientPubKeyArray [32]byte
@@ -323,7 +335,7 @@ func (r *userReactor) getClientAesKeyAndIV(clientKey string, dhServerPrivKey [32
 
 	aesIV := wkutil.GetRandomString(16)
 	aesKey := wkutil.MD5(base64.StdEncoding.EncodeToString(shareKey[:]))[:16]
-	return aesKey, aesIV, nil
+	return []byte(aesKey), []byte(aesIV), nil
 }
 
 func (r *userReactor) authResponse(connCtx *connContext, packet *wkproto.ConnackPacket) {
@@ -336,15 +348,15 @@ func (r *userReactor) authResponse(connCtx *connContext, packet *wkproto.Connack
 			DeviceId:     connCtx.deviceId,
 			ConnId:       connCtx.proxyConnId,
 			ServerKey:    packet.ServerKey,
-			AesKey:       connCtx.aesKey,
-			AesIV:        connCtx.aesIV,
+			AesKey:       string(connCtx.aesKey),
+			AesIV:        string(connCtx.aesIV),
 			DeviceLevel:  connCtx.deviceLevel,
 			ProtoVersion: connCtx.protoVersion,
 		})
 		if err != nil {
 			r.Error("requestUserAuthResult error", zap.String("uid", connCtx.uid), zap.String("deviceId", connCtx.deviceId), zap.Error(err))
 		}
-		if status == proto.Status_NotFound { // 这个代号说明代理服务器不存在此连接了，所以这里也直接移除
+		if status == proto.StatusNotFound { // 这个代号说明代理服务器不存在此连接了，所以这里也直接移除
 			r.Error("requestUserAuthResult not found", zap.String("uid", connCtx.uid), zap.String("deviceId", connCtx.deviceId))
 			r.removeConnById(connCtx.uid, connCtx.connId)
 			connCtx.close()
@@ -366,13 +378,13 @@ func (r *userReactor) authResponseConnackAuthFail(connCtx *connContext) {
 func (r *userReactor) requestUserAuthResult(nodeId uint64, result *UserAuthResult) (proto.Status, error) {
 	data, err := result.Marshal()
 	if err != nil {
-		return proto.Status_ERROR, err
+		return proto.StatusError, err
 	}
 	timeoutCtx, cancel := context.WithTimeout(r.s.ctx, time.Second*5)
 	defer cancel()
 	resp, err := r.s.cluster.RequestWithContext(timeoutCtx, nodeId, "/wk/userAuthResult", data)
 	if err != nil {
-		return proto.Status_ERROR, err
+		return proto.StatusError, err
 	}
 
 	return resp.Status, nil
@@ -382,6 +394,7 @@ type userAuthReq struct {
 	uniqueNo string
 	uid      string
 	messages []ReactorUserMessage
+	sub      *userReactorSub
 }
 
 // 用户认证结果
@@ -457,8 +470,13 @@ func (u *UserAuthResult) Unmarshal(data []byte) error {
 func (r *userReactor) addPingReq(req *pingReq) {
 	select {
 	case r.processPingC <- req:
-	case <-r.stopper.ShouldStop():
-		return
+	default:
+		r.Warn("addPingReq: processPingC is full, ignore ", zap.String("uid", req.uid), zap.Int("msgCount", len(req.messages)))
+		req.sub.step(req.uid, UserAction{
+			UniqueNo:   req.uniqueNo,
+			ActionType: UserActionPingResp,
+			Reason:     ReasonError,
+		})
 	}
 }
 
@@ -498,50 +516,34 @@ func (r *userReactor) processPingLoop() {
 
 func (r *userReactor) processPing(reqs []*pingReq) {
 	for _, req := range reqs {
-		if len(req.messages) == 0 {
-			continue
-		}
-		var reason = ReasonSuccess
-		err := r.handlePing(req)
-		if err != nil {
-			r.Error("handlePing err", zap.Error(err))
-			reason = ReasonError
-		}
-
-		lastMsg := req.messages[len(req.messages)-1]
-		r.reactorSub(req.uid).step(req.uid, UserAction{
-			UniqueNo:   req.uniqueNo,
-			ActionType: UserActionPingResp,
-			Reason:     reason,
-			Index:      lastMsg.Index,
-		})
-
+		r.handlePing(req)
 	}
 }
 
-func (r *userReactor) handlePing(req *pingReq) error {
+func (r *userReactor) handlePing(req *pingReq) {
 	for _, msg := range req.messages {
 		conn := r.getConnById(req.uid, msg.ConnId)
-		if conn == nil {
-			r.Debug("conn not found", zap.String("uid", req.uid), zap.Int64("connId", msg.ConnId))
-			continue
+		if conn != nil && conn.isRealConn { // 不是真实连接可以忽略
+			err := r.s.userReactor.writePacket(conn, &wkproto.PongPacket{})
+			if err != nil {
+				r.Error("write pong packet error", zap.String("uid", req.uid), zap.Error(err))
+			}
 		}
-		if !conn.isRealConn { // 不是真实连接可以忽略
-			continue
-		}
-		err := r.s.userReactor.writePacket(conn, &wkproto.PongPacket{})
-		if err != nil {
-			r.Error("write pong packet error", zap.String("uid", req.uid), zap.Error(err))
-		}
+		lastMsg := req.messages[len(req.messages)-1]
+		req.sub.step(req.uid, UserAction{
+			UniqueNo:   req.uniqueNo,
+			ActionType: UserActionPingResp,
+			Reason:     ReasonSuccess,
+			Index:      lastMsg.Index,
+		})
 	}
-
-	return nil
 }
 
 type pingReq struct {
 	uniqueNo string
 	uid      string
 	messages []ReactorUserMessage
+	sub      *userReactorSub
 }
 
 // =================================== recvack ===================================
@@ -549,30 +551,102 @@ type pingReq struct {
 func (r *userReactor) addRecvackReq(req *recvackReq) {
 	select {
 	case r.processRecvackC <- req:
-	case <-r.stopper.ShouldStop():
-		return
+	default:
+		r.Warn("addRecvackReq: processRecvackC is full, ignore ", zap.String("uid", req.uid), zap.Int("msgCount", len(req.messages)))
+		req.sub.step(req.uid, UserAction{
+			UniqueNo:   req.uniqueNo,
+			ActionType: UserActionRecvackResp,
+			Reason:     ReasonError,
+		})
 	}
 }
 
 func (r *userReactor) processRecvackLoop() {
+	const batchSize = 4096
+	reqs := make([]*recvackReq, 0, batchSize)
+	done := false
 	for !r.stopped.Load() {
 		select {
 		case req := <-r.processRecvackC:
-			r.processRecvack(req)
+			reqs = append(reqs, req)
+
+			for !done {
+				select {
+				case req := <-r.processRecvackC:
+					exist := false
+					for _, r := range reqs {
+						if r.uid == req.uid {
+							r.messages = append(r.messages, req.messages...)
+							exist = true
+							break
+						}
+					}
+					if !exist {
+						reqs = append(reqs, req)
+					}
+					if len(reqs) >= batchSize {
+						done = true
+					}
+				default:
+					done = true
+				}
+			}
+			r.processRecvacks(reqs)
+			done = false
+			reqs = reqs[:0]
 		case <-r.stopper.ShouldStop():
 			return
 		}
 	}
 }
 
+func (r *userReactor) processRecvacks(reqs []*recvackReq) {
+
+	timeoutCtx, cancel := context.WithTimeout(r.s.ctx, time.Second*5)
+	defer cancel()
+	g, _ := errgroup.WithContext(timeoutCtx)
+	g.SetLimit(1000)
+	for _, req := range reqs {
+		req := req
+		g.Go(func() error {
+			r.processRecvack(req)
+			return nil
+		})
+
+	}
+	_ = g.Wait()
+}
+
 func (r *userReactor) processRecvack(req *recvackReq) {
-
-	// r.s.retryManager.removeRetry()
-
 	for _, msg := range req.messages {
 		recvackPacket := msg.InPacket.(*wkproto.RecvackPacket)
-		r.Trace("消息回执", "processRecvack", zap.Int64("messageId", recvackPacket.MessageID), zap.Uint32("messageSeq", recvackPacket.MessageSeq), zap.String("uid", req.uid), zap.String("deviceId", msg.DeviceId), zap.Int64("connId", msg.ConnId))
-		persist := !recvackPacket.NoPersist
+		if r.s.opts.Logger.TraceOn {
+			r.Trace("消息回执", "processRecvack", zap.Int64("messageId", recvackPacket.MessageID), zap.Uint32("messageSeq", recvackPacket.MessageSeq), zap.String("uid", req.uid), zap.String("deviceId", msg.DeviceId), zap.Int64("connId", msg.ConnId))
+		}
+
+		persist := !recvackPacket.NoPersist                      // 是否需要持久化
+		conn := r.s.userReactor.getConnById(req.uid, msg.ConnId) // 获取当前连接
+		if conn != nil {
+			isCmd := recvackPacket.SyncOnce                           // 是命令消息
+			isMaster := conn.deviceLevel == wkproto.DeviceLevelMaster // 是master设备，只有master设备才能擦除指令消息
+			if isCmd && persist && isMaster {
+				currMsg := r.s.retryManager.retryMessage(msg.ConnId, recvackPacket.MessageID)
+				if currMsg != nil {
+					// 删除最近会话的缓存
+					r.s.conversationManager.DeleteUserConversationFromCache(req.uid, currMsg.channelId, currMsg.channelType)
+					if req.uid != r.s.opts.SystemUID {
+						// 更新最近会话的已读位置
+						err := r.s.store.DB().UpdateConversationIfSeqGreaterAsync(req.uid, currMsg.channelId, currMsg.channelType, uint64(recvackPacket.MessageSeq))
+						if err != nil {
+							r.Error("UpdateConversationIfSeqGreaterAsync failed", zap.Error(err), zap.String("uid", req.uid), zap.String("channelId", currMsg.channelId), zap.Uint8("channelType", currMsg.channelType), zap.Uint64("messageSeq", uint64(recvackPacket.MessageSeq)))
+						}
+					}
+				}
+			}
+		} else {
+			r.Debug("processRecvack: conn not found", zap.String("uid", req.uid), zap.Int64("connId", msg.ConnId))
+		}
+
 		if persist { // 只有需要持久化的消息才会重试
 			// r.Debug("remove retry", zap.String("uid", req.uid), zap.Int64("connId", msg.ConnId), zap.Int64("messageID", recvackPacket.MessageID))
 			err := r.s.retryManager.removeRetry(msg.ConnId, recvackPacket.MessageID)
@@ -580,21 +654,22 @@ func (r *userReactor) processRecvack(req *recvackReq) {
 				r.Warn("removeRetry error", zap.Error(err), zap.String("uid", req.uid), zap.String("deviceId", msg.DeviceId), zap.Int64("connId", msg.ConnId), zap.Int64("messageID", recvackPacket.MessageID))
 			}
 		}
+
 	}
 	lastMsg := req.messages[len(req.messages)-1]
-	r.reactorSub(req.uid).step(req.uid, UserAction{
+	req.sub.step(req.uid, UserAction{
 		UniqueNo:   req.uniqueNo,
 		ActionType: UserActionRecvackResp,
 		Index:      lastMsg.Index,
 		Reason:     ReasonSuccess,
 	})
-
 }
 
 type recvackReq struct {
 	uniqueNo string
 	uid      string
 	messages []ReactorUserMessage
+	sub      *userReactorSub
 }
 
 // =================================== write ===================================
@@ -602,13 +677,19 @@ type recvackReq struct {
 func (r *userReactor) addWriteReq(req *writeReq) {
 	select {
 	case r.processWriteC <- req:
-	case <-r.stopper.ShouldStop():
-		return
+	default:
+		r.Warn("addWriteReq: processWriteC is full, ignore ", zap.String("uid", req.uid), zap.Int("msgCount", len(req.messages)))
+		req.sub.step(req.uid, UserAction{
+			UniqueNo:   req.uniqueNo,
+			ActionType: UserActionRecvResp,
+			Reason:     ReasonError,
+		})
 	}
 }
 
 func (r *userReactor) processWriteLoop() {
-	reqs := make([]*writeReq, 0, 100)
+	const batchSize = 2048
+	reqs := make([]*writeReq, 0, batchSize)
 	done := false
 	for !r.stopped.Load() {
 		select {
@@ -628,6 +709,9 @@ func (r *userReactor) processWriteLoop() {
 					if !exist {
 						reqs = append(reqs, req)
 					}
+					if len(reqs) >= batchSize {
+						done = true
+					}
 				default:
 					done = true
 				}
@@ -637,43 +721,49 @@ func (r *userReactor) processWriteLoop() {
 			reqs = reqs[:0]
 		case <-r.stopper.ShouldStop():
 			return
+
 		}
 	}
 }
 
 func (r *userReactor) processWrite(reqs []*writeReq) {
-	var reason Reason
+
+	timeoutCtx, cancel := context.WithTimeout(r.s.ctx, time.Second*5)
+	defer cancel()
+	g, _ := errgroup.WithContext(timeoutCtx)
+	g.SetLimit(1000)
+
 	for _, req := range reqs {
-		reason = ReasonSuccess
-		err := r.handleWrite(req)
-		if err != nil {
-			r.Warn("handleWrite err", zap.Error(err))
-			reason = ReasonError
-		}
-		var maxIndex uint64
-		for _, msg := range req.messages {
-			if msg.Index > maxIndex {
-				maxIndex = msg.Index
+		req := req
+		g.Go(func() error {
+			err := r.handleWrite(req)
+			if err != nil {
+				r.Warn("handleWrite err", zap.Error(err))
 			}
-		}
-		r.reactorSub(req.uid).step(req.uid, UserAction{
-			UniqueNo:   req.uniqueNo,
-			ActionType: UserActionRecvResp,
-			Index:      maxIndex,
-			Reason:     reason,
+			var maxIndex uint64
+			for _, msg := range req.messages {
+				if msg.Index > maxIndex {
+					maxIndex = msg.Index
+				}
+			}
+			req.sub.step(req.uid, UserAction{
+				UniqueNo:   req.uniqueNo,
+				ActionType: UserActionRecvResp,
+				Index:      maxIndex,
+				Reason:     ReasonSuccess,
+			})
+			return nil
 		})
-		// conn := r.getConnContext(req.toUid, req.toDeviceId)
-		// if conn == nil || len(req.data) == 0 {
-		// 	return
-		// }
-		// r.s.responseData(conn.conn, req.data)
 	}
+
+	_ = g.Wait()
 
 }
 
 func (r *userReactor) handleWrite(req *writeReq) error {
 
-	sub := r.reactorSub(req.uid)
+	forwardWriteReqMap := map[uint64]FowardWriteReqSlice{} // 按照节点分组
+	sub := req.sub
 	for _, msg := range req.messages {
 		conns := sub.getConnsByDeviceId(req.uid, msg.DeviceId)
 		if len(conns) == 0 {
@@ -690,24 +780,30 @@ func (r *userReactor) handleWrite(req *writeReq) error {
 					return errors.New("node not online")
 				}
 
-				status, err := r.fowardWriteReq(conn.realNodeId, &FowardWriteReq{
+				forwardWriteReqMap[conn.realNodeId] = append(forwardWriteReqMap[conn.realNodeId], &FowardWriteReq{
 					Uid:            req.uid,
 					DeviceId:       msg.DeviceId,
 					ConnId:         conn.proxyConnId,
 					RecvFrameCount: 1,
 					Data:           msg.OutBytes,
+					localConnId:    conn.connId,
 				})
-				if err != nil {
-					r.Error("fowardWriteReq error", zap.Error(err), zap.String("uid", req.uid), zap.String("deviceId", msg.DeviceId))
-					r.removeConnById(conn.uid, conn.connId) // 转发失败了，这里直接移除连接
-					return err
-				}
-				if status == proto.Status(errCodeConnNotFound) { // 连接不存在了，所以这里也移除
-					r.removeConnById(conn.uid, conn.connId)
 
-				}
 			}
 		}
+	}
+
+	for nodeId, reqs := range forwardWriteReqMap {
+		for _, req := range reqs {
+			_, err := r.fowardWriteReq(nodeId, req)
+			if err != nil {
+				r.Error("fowardWriteReq error", zap.Error(err))
+				// 如果转发失败，这里直接移除连接
+				sub.removeConnById(req.Uid, req.localConnId)
+				continue
+			}
+		}
+
 	}
 	return nil
 }
@@ -724,8 +820,8 @@ func (r *userReactor) fowardWriteReq(nodeId uint64, req *FowardWriteReq) (proto.
 	if err != nil {
 		return 0, err
 	}
-	if resp.Status == proto.Status_OK {
-		return proto.Status_OK, nil
+	if resp.Status == proto.StatusOK {
+		return proto.StatusOK, nil
 	}
 	return resp.Status, nil
 }
@@ -734,6 +830,7 @@ type writeReq struct {
 	uniqueNo string
 	uid      string
 	messages []ReactorUserMessage
+	sub      *userReactorSub
 }
 
 // =================================== 转发userAction ===================================
@@ -741,13 +838,21 @@ type writeReq struct {
 func (r *userReactor) addForwardUserActionReq(action UserAction) {
 	select {
 	case r.processForwardUserActionC <- action:
-	case <-r.stopper.ShouldStop():
-		return
+	default:
+		r.Warn("addForwardUserActionReq: processForwardUserActionC is full, ignore ", zap.String("uid", action.Uid), zap.String("actionType", action.ActionType.String()))
+		sub := r.reactorSub(action.Uid)
+		sub.step(action.Uid, UserAction{
+			UniqueNo:   action.UniqueNo,
+			ActionType: UserActionForwardResp,
+			Uid:        action.Uid,
+			Reason:     ReasonError,
+		})
 	}
 }
 
 func (r *userReactor) processForwardUserActionLoop() {
-	actions := make([]UserAction, 0, 100)
+	const batchSize = 2048
+	actions := make([]UserAction, 0, batchSize)
 	done := false
 	for !r.stopped.Load() {
 		select {
@@ -757,11 +862,13 @@ func (r *userReactor) processForwardUserActionLoop() {
 				select {
 				case req := <-r.processForwardUserActionC:
 					actions = append(actions, req)
+					if len(actions) >= batchSize {
+						done = true
+					}
 				default:
 					done = true
 				}
 			}
-
 			r.processForwardUserAction(actions)
 			done = false
 			actions = actions[:0]
@@ -772,6 +879,11 @@ func (r *userReactor) processForwardUserActionLoop() {
 }
 
 func (r *userReactor) processForwardUserAction(actions []UserAction) {
+
+	r.handleForwardUserAction(actions)
+}
+
+func (r *userReactor) handleForwardUserAction(actions []UserAction) {
 	userForwardActionMap := map[string][]UserAction{} // 用户对应的action
 	userLeaderMap := map[string]uint64{}              // 用户对应的领导节点
 	// 按照用户分组
@@ -798,7 +910,7 @@ func (r *userReactor) processForwardUserAction(actions []UserAction) {
 			}
 			reason = ReasonError
 		} else {
-			newLeaderId, err = r.handleForwardUserAction(uid, leaderId, fowardActions)
+			newLeaderId, err = r.requestForwardUserAction(uid, leaderId, fowardActions)
 			if err != nil {
 				r.Error("handleForwardUserAction error", zap.Error(err))
 				reason = ReasonError
@@ -812,6 +924,7 @@ func (r *userReactor) processForwardUserAction(actions []UserAction) {
 				UniqueNo:   fowardActions[0].UniqueNo,
 				ActionType: UserActionLeaderChange,
 				LeaderId:   newLeaderId,
+				Reason:     ReasonSuccess,
 			})
 		}
 		for _, forwardAction := range fowardActions {
@@ -830,7 +943,7 @@ func (r *userReactor) processForwardUserAction(actions []UserAction) {
 
 }
 
-func (r *userReactor) handleForwardUserAction(uid string, leaderId uint64, actions []UserAction) (uint64, error) {
+func (r *userReactor) requestForwardUserAction(uid string, leaderId uint64, actions []UserAction) (uint64, error) {
 	needChangeLeader, err := r.forwardUserAction(leaderId, actions)
 	if err != nil {
 		return 0, err
@@ -866,7 +979,7 @@ func (r *userReactor) forwardUserAction(nodeId uint64, actions []UserAction) (bo
 	if resp.Status == proto.Status(errCodeNotIsUserLeader) {
 		return true, nil
 	}
-	if resp.Status != proto.Status_OK {
+	if resp.Status != proto.StatusOK {
 		return false, fmt.Errorf("forwardUserAction failed, status=%d", resp.Status)
 	}
 	return false, nil
@@ -877,8 +990,9 @@ func (r *userReactor) forwardUserAction(nodeId uint64, actions []UserAction) (bo
 func (r *userReactor) addNodePingReq(req *nodePingReq) {
 	select {
 	case r.processNodePingC <- req:
-	case <-r.stopper.ShouldStop():
-		return
+	default:
+		r.Warn("addNodePingReq: processNodePingC is full, ignore ", zap.String("uid", req.uid), zap.Int("msgCount", len(req.messages)))
+
 	}
 }
 
@@ -919,7 +1033,10 @@ func (r *userReactor) processNodePingLoop() {
 }
 
 func (r *userReactor) processNodePing(reqs []*nodePingReq) {
-	// r.s.cluster.PingNode(req.nodeId)
+	r.handleNodePing(reqs)
+}
+
+func (r *userReactor) handleNodePing(reqs []*nodePingReq) {
 
 	nodeIdMap := map[uint64][]*userConns{} // 按照节点分组
 	for _, req := range reqs {
@@ -1028,8 +1145,8 @@ func (u *userNodePingReq) Unmarshal(data []byte) error {
 func (r *userReactor) addNodePongReq(req *nodePongReq) {
 	select {
 	case r.processNodePongC <- req:
-	case <-r.stopper.ShouldStop():
-		return
+	default:
+		r.Warn("addNodePongReq: processNodePongC is full, ignore ", zap.String("uid", req.uid))
 	}
 }
 
@@ -1044,8 +1161,12 @@ func (r *userReactor) processNodePongLoop() {
 	}
 }
 
-// TODO：可以优化成批量处理
 func (r *userReactor) processNodePong(req *nodePongReq) {
+	r.handleNodePong(req)
+}
+
+// TODO：可以优化成批量处理
+func (r *userReactor) handleNodePong(req *nodePongReq) {
 
 	userHandler := r.s.userReactor.getUserHandler(req.uid)
 	if userHandler == nil {
@@ -1123,8 +1244,8 @@ func (u *userConns) Unmarshal(data []byte) error {
 func (r *userReactor) addProxyNodeTimeoutReq(req *proxyNodeTimeoutReq) {
 	select {
 	case r.processProxyNodeTimeoutC <- req:
-	case <-r.stopper.ShouldStop():
-		return
+	default:
+		r.Warn("addProxyNodeTimeoutReq: processProxyNodeTimeoutC is full, ignore ", zap.String("uid", req.uid))
 	}
 }
 
@@ -1157,8 +1278,8 @@ type proxyNodeTimeoutReq struct {
 func (r *userReactor) addCloseReq(req *userCloseReq) {
 	select {
 	case r.processCloseC <- req:
-	case <-r.stopper.ShouldStop():
-		return
+	default:
+		r.Warn("addCloseReq: processCloseC is full, ignore ", zap.String("uid", req.handler.uid))
 	}
 
 }
@@ -1183,7 +1304,7 @@ func (r *userReactor) processClose(req *userCloseReq) {
 		for _, conn := range conns {
 			// 如果是本地连接，则移除后需要关闭连接，节省资源
 			if conn.isRealConn {
-				r.Info("close real conn", zap.String("uid", uid), zap.Int64("connId", conn.connId))
+				r.Info("close real conn", zap.String("uid", uid), zap.Int64("connId", conn.connId), zap.String("role", req.handler.role.String()))
 				r.removeConnById(uid, conn.connId)
 				conn.close()
 			} else {
@@ -1210,19 +1331,43 @@ type userCloseReq struct {
 func (r *userReactor) addCheckLeaderReq(req *checkLeaderReq) {
 	select {
 	case r.processCheckLeaderC <- req:
-	case <-r.stopper.ShouldStop():
-		return
+	default:
+		r.Warn("addCheckLeaderReq: processCheckLeaderC is full, ignore ", zap.String("uid", req.uid))
 	}
 }
 
 func (r *userReactor) processCheckLeaderLoop() {
+	batch := 1024
+	reqs := make([]*checkLeaderReq, 0, batch)
+	done := false
 	for !r.stopped.Load() {
 		select {
 		case req := <-r.processCheckLeaderC:
-			r.processCheckLeader(req)
+			reqs = append(reqs, req)
+			for !done {
+				select {
+				case req := <-r.processCheckLeaderC:
+					reqs = append(reqs, req)
+					if len(reqs) >= batch {
+						done = true
+					}
+				default:
+					done = true
+				}
+			}
+			r.processCheckLeaders(reqs)
+			done = false
+			reqs = reqs[:0]
+
 		case <-r.stopper.ShouldStop():
 			return
 		}
+	}
+}
+
+func (r *userReactor) processCheckLeaders(reqs []*checkLeaderReq) {
+	for _, req := range reqs {
+		r.processCheckLeader(req)
 	}
 }
 
@@ -1235,7 +1380,7 @@ func (r *userReactor) processCheckLeader(req *checkLeaderReq) {
 	}
 	if leaderId != req.leaderId {
 		r.Info("leader change", zap.String("uid", req.uid), zap.Uint64("newLeaderId", leaderId), zap.Uint64("oldLeaderId", req.leaderId))
-		r.reactorSub(req.uid).step(req.uid, UserAction{
+		req.sub.step(req.uid, UserAction{
 			UniqueNo:   req.uniqueNo,
 			ActionType: UserActionLeaderChange,
 			LeaderId:   leaderId,
@@ -1247,4 +1392,5 @@ type checkLeaderReq struct {
 	uniqueNo string
 	uid      string
 	leaderId uint64
+	sub      *userReactorSub
 }

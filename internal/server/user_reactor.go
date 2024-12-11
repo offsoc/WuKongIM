@@ -1,12 +1,15 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"hash/fnv"
+	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 	"github.com/lni/goutils/syncutil"
+	"github.com/panjf2000/ants/v2"
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
 )
@@ -25,6 +28,8 @@ type userReactor struct {
 	processCloseC             chan *userCloseReq        // 关闭请求
 	processCheckLeaderC       chan *checkLeaderReq      // 检查leader请求
 
+	processGoPool *ants.MultiPool
+
 	stopper *syncutil.Stopper
 	wklog.Log
 	s    *Server
@@ -41,7 +46,7 @@ func newUserReactor(s *Server) *userReactor {
 		processPingC:              make(chan *pingReq, 1024),
 		processRecvackC:           make(chan *recvackReq, 1024),
 		processWriteC:             make(chan *writeReq, 1024),
-		processForwardUserActionC: make(chan UserAction, 1024),
+		processForwardUserActionC: make(chan UserAction, 1024*10),
 		processNodePingC:          make(chan *nodePingReq, 1024),
 		processNodePongC:          make(chan *nodePongReq, 1024),
 		processProxyNodeTimeoutC:  make(chan *proxyNodeTimeoutReq, 1024),
@@ -58,33 +63,54 @@ func newUserReactor(s *Server) *userReactor {
 		u.subs[i] = sub
 	}
 
+	size := 0
+	sizePerPool := 0
+	if s.opts.Reactor.User.ProcessPoolSize <= s.opts.Reactor.User.SubCount {
+		size = 1
+		sizePerPool = s.opts.Reactor.User.ProcessPoolSize
+	} else {
+		size = s.opts.Reactor.User.SubCount
+		sizePerPool = s.opts.Reactor.User.ProcessPoolSize / s.opts.Reactor.User.SubCount
+	}
+	var err error
+	u.processGoPool, err = ants.NewMultiPool(size, sizePerPool, ants.LeastTasks, ants.WithPanicHandler(func(i interface{}) {
+		u.Panic("user: processGoPool panic", zap.Any("panic", i), zap.Stack("stack"))
+	}))
+	if err != nil {
+		u.Panic("user: NewMultiPool panic", zap.Error(err))
+	}
 	return u
 }
 
 func (u *userReactor) start() error {
 
 	// 高并发处理，适用于分散的耗时任务
-	for i := 0; i < 50; i++ {
+	for i := 0; i < 100; i++ {
 
-		u.stopper.RunWorker(u.processWriteLoop)
-		u.stopper.RunWorker(u.processRecvackLoop)
-		u.stopper.RunWorker(u.processNodePongLoop)
 	}
 
 	// 中并发处理，适合于分散但是不是很耗时的任务
-	for i := 0; i < 10; i++ {
-		u.stopper.RunWorker(u.processInitLoop)
-		u.stopper.RunWorker(u.processProxyNodeTimeoutLoop)
-		u.stopper.RunWorker(u.processCloseLoop)
-		u.stopper.RunWorker(u.processCheckLeaderLoop)
+	for i := 0; i < 50; i++ {
+		u.stopper.RunWorker(u.processWriteLoop)
+		u.stopper.RunWorker(u.processForwardUserActionLoop)
+
 	}
 
 	// 低并发处理，适合于集中的耗时任务，这样可以合并请求批量处理
 	for i := 0; i < 1; i++ {
+		u.stopper.RunWorker(u.processInitLoop)
+		u.stopper.RunWorker(u.processProxyNodeTimeoutLoop)
+		u.stopper.RunWorker(u.processCloseLoop)
+
+		u.stopper.RunWorker(u.processNodePongLoop)
+
+		u.stopper.RunWorker(u.processRecvackLoop)
+		u.stopper.RunWorker(u.processCheckLeaderLoop)
+
 		u.stopper.RunWorker(u.processNodePingLoop)
 		u.stopper.RunWorker(u.processPingLoop)
 		u.stopper.RunWorker(u.processAuthLoop)
-		u.stopper.RunWorker(u.processForwardUserActionLoop)
+
 	}
 
 	for _, sub := range u.subs {
@@ -216,4 +242,8 @@ func (u *userReactor) writePacketByConnId(uid string, connId int64, packet wkpro
 		return ErrConnNotFound
 	}
 	return u.reactorSub(uid).writePacket(conn, packet)
+}
+
+func (u *userReactor) WithTimeout() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(u.s.ctx, time.Second*10)
 }
