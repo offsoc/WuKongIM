@@ -5,6 +5,9 @@ wsAddr: "ws://0.0.0.0:5210"
 rootDir: "./wukongimdata/1"
 pprofOn: true
 tokenAuthOn: false
+stress: true
+intranet:
+  tcpAddr: "127.0.0.1:15100"
 # whitelistOffOfPerson: false
 logger:
   traceOn: false
@@ -20,12 +23,18 @@ demo:
   addr: "0.0.0.0:5172"
 conversation:
   on: true   
+# reactor: 
+#   channel:
+#     subCount: 1
+#   user:
+#     subCount: 1    
 cluster:
   nodeId: 1
   addr: "tcp://127.0.0.1:10001"
   slotCount: 64
   slotReplicaCount: 3
   channelReplicaCount: 3
+  # channelReactorSubCount: 1
   apiUrl: "http://127.0.0.1:5001"
   initNodes: 
     - "1@127.0.0.1:10001"

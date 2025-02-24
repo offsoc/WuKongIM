@@ -2,7 +2,12 @@ package server
 
 import (
 	"strings"
+	"time"
 
+	"github.com/WuKongIM/WuKongIM/internal/eventbus"
+	"github.com/WuKongIM/WuKongIM/internal/options"
+	"github.com/WuKongIM/WuKongIM/internal/track"
+	"github.com/WuKongIM/WuKongIM/pkg/fasttime"
 	"github.com/WuKongIM/WuKongIM/pkg/wknet"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 	"go.uber.org/zap"
@@ -18,11 +23,11 @@ func (s *Server) onData(conn wknet.Conn) error {
 	}
 
 	var isAuth bool
-	var connCtx *connContext
+	var connCtx *eventbus.Conn
 	connCtxObj := conn.Context()
 	if connCtxObj != nil {
-		connCtx = connCtxObj.(*connContext)
-		isAuth = connCtx.isAuth.Load()
+		connCtx = connCtxObj.(*eventbus.Conn)
+		isAuth = connCtx.Auth
 	} else {
 		isAuth = false
 	}
@@ -76,33 +81,35 @@ func (s *Server) onData(conn wknet.Conn) error {
 			conn.Close()
 			return nil
 		}
-		if IsSpecialChar(connectPacket.UID) {
+		if options.IsSpecialChar(connectPacket.UID) {
 			s.Warn("UID is illegal,conn will be closed", zap.String("uid", connectPacket.UID))
 			conn.Close()
 			return nil
 		}
 
-		sub := s.userReactor.reactorSub(connectPacket.UID)
-		connInfo := connInfo{
-			connId:       conn.ID(),
-			uid:          connectPacket.UID,
-			deviceId:     connectPacket.DeviceID,
-			deviceFlag:   wkproto.DeviceFlag(connectPacket.DeviceFlag),
-			protoVersion: connectPacket.Version,
+		connCtx = &eventbus.Conn{
+			NodeId:       s.opts.Cluster.NodeId,
+			ConnId:       conn.ID(),
+			Uid:          connectPacket.UID,
+			DeviceId:     connectPacket.DeviceID,
+			DeviceFlag:   wkproto.DeviceFlag(connectPacket.DeviceFlag),
+			ProtoVersion: connectPacket.Version,
+			Uptime:       fasttime.UnixTimestamp(),
 		}
-		connCtx = newConnContext(connInfo, conn, sub)
 		conn.SetContext(connCtx)
 
-		// 添加用户的连接，如果用户不存在则创建
-		s.userReactor.addConnAndCreateUserHandlerIfNotExist(connCtx)
+		conn.SetMaxIdle(time.Second * 4) // 给4秒的时间去认证
 
-		connCtx.addConnectPacket(connectPacket)
+		// 添加连接事件
+		eventbus.User.Connect(connCtx, connectPacket)
+		eventbus.User.Advance(connCtx.Uid)
 
 		_, _ = conn.Discard(len(data))
 	} else {
 		offset := 0
+		var events []*eventbus.Event
 		for len(data) > offset {
-			frame, size, err := s.opts.Proto.DecodeFrame(data[offset:], connCtx.protoVersion)
+			frame, size, err := s.opts.Proto.DecodeFrame(data[offset:], connCtx.ProtoVersion)
 			if err != nil { //
 				s.Warn("Failed to decode the message", zap.Error(err))
 				conn.Close()
@@ -111,15 +118,33 @@ func (s *Server) onData(conn wknet.Conn) error {
 			if frame == nil {
 				break
 			}
-			offset += size
-			if frame.GetFrameType() == wkproto.SEND {
-				sendPacket := frame.(*wkproto.SendPacket)
-
-				connCtx.addSendPacket(sendPacket)
-			} else {
-				connCtx.addOtherPacket(frame)
+			if events == nil {
+				events = make([]*eventbus.Event, 0, 10)
 			}
+			event := &eventbus.Event{
+				Type:         eventbus.EventOnSend,
+				Frame:        frame,
+				Conn:         connCtx,
+				SourceNodeId: options.G.Cluster.NodeId,
+				Track: track.Message{
+					PreStart: time.Now(),
+				},
+			}
+			event.Track.Record(track.PositionStart)
+			// 生成messageId
+			if frame.GetFrameType() == wkproto.SEND {
+				event.MessageId = options.G.GenMessageId()
+			}
+
+			events = append(events, event)
+			offset += size
 		}
+		if len(events) > 0 {
+			// 添加事件
+			eventbus.User.AddEvents(connCtx.Uid, events)
+
+		}
+
 		_, _ = conn.Discard(offset)
 	}
 

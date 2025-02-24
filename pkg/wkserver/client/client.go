@@ -60,12 +60,12 @@ func New(addr string, opt ...Option) *Client {
 		routeMap:  make(map[string]Handler),
 		proto:     proto.New(),
 		w:         wait.New(),
-		batchRead: 100,
+		batchRead: 1000,
 	}
 
 	c.cancelCtx, c.cancel = context.WithCancel(context.Background())
 	var err error
-	c.pool, err = ants.NewPool(1024*10, ants.WithNonblocking(true), ants.WithExpiryDuration(time.Second*10))
+	c.pool, err = ants.NewPool(1024*10, ants.WithNonblocking(true))
 	if err != nil {
 		c.Panic("new pool failed", zap.Error(err), zap.Stack("stack"))
 	}
@@ -77,7 +77,7 @@ func New(addr string, opt ...Option) *Client {
 	c.conns = make([]*conn, 1)
 	c.conns[0] = newConn(addr, c) // 目前只支持一个连接
 
-	gc, err := gnet.NewClient(c.event, gnet.WithTicker(true))
+	gc, err := gnet.NewClient(c.event, gnet.WithTicker(true), gnet.WithMulticore(true))
 	if err != nil {
 		c.Panic("new client failed", zap.Error(err))
 		return nil
@@ -126,7 +126,7 @@ func (c *Client) Send(m *proto.Message) error {
 	if err != nil {
 		return err
 	}
-	data, err := c.proto.Encode(msgData, uint8(proto.MsgTypeMessage))
+	data, err := c.proto.Encode(msgData, proto.MsgTypeMessage)
 	if err != nil {
 		return err
 	}
@@ -154,7 +154,7 @@ func (c *Client) RequestWithContext(ctx context.Context, p string, body []byte) 
 		return nil, errors.New("conn is nil")
 	}
 	if c.conn().status.Load() != authed {
-		c.Error("connect not authed", zap.String("addr", c.opts.Addr))
+		c.Error("connect not authed", zap.String("addr", c.opts.Addr), zap.String("path", p))
 		return nil, errors.New("connect not authed")
 	}
 
@@ -171,14 +171,19 @@ func (c *Client) RequestWithContext(ctx context.Context, p string, body []byte) 
 
 	c.Requesting.Inc()
 
-	msgData, err := c.proto.Encode(data, proto.MsgTypeRequest.Uint8())
+	msgData, err := c.proto.Encode(data, proto.MsgTypeRequest)
 	if err != nil {
 		return nil, err
 	}
+	start := time.Now()
 	ch := c.w.Register(r.Id)
 	err = c.conn().asyncWrite(msgData)
 	if err != nil {
 		return nil, err
+	}
+	cost := time.Since(start)
+	if cost > time.Millisecond*100 {
+		c.Warn("request cost too long", zap.Duration("cost", cost), zap.String("path", p))
 	}
 	select {
 	case x := <-ch:
@@ -209,13 +214,13 @@ func (c *Client) handler(p string) Handler {
 	return c.routeMap[p]
 }
 
-func (c *Client) handleData(data []byte, msgType proto.MsgType) {
+func (c *Client) handleData(data []byte, msgType proto.MsgType, remoteAddr string) {
 
 	c.conn().idleTick = 0
 	c.conn().timeoutTick = 0
 
 	if c.opts.LogDetailOn {
-		c.Info("handleData....", zap.Uint8("msgType", msgType.Uint8()), zap.Int("data", len(data)))
+		c.Info("handleData....", zap.Uint8("msgType", msgType.Uint8()), zap.Int("data", len(data)), zap.String("remoteAddr", remoteAddr))
 	}
 
 	if msgType == proto.MsgTypeRequest {

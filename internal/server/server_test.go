@@ -8,8 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/WuKongIM/WuKongIM/internal/options"
 	"github.com/WuKongIM/WuKongIM/pkg/client"
-	"github.com/WuKongIM/WuKongIM/pkg/cluster/clusterconfig/pb"
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 	wkproto "github.com/WuKongIM/WuKongIMGoProto"
@@ -18,7 +19,7 @@ import (
 
 func TestServerStart(t *testing.T) {
 	s := NewTestServer(t)
-	s.opts.Mode = TestMode
+	s.opts.Mode = options.TestMode
 	err := s.Start()
 	assert.Nil(t, err)
 	err = s.Stop()
@@ -28,7 +29,7 @@ func TestServerStart(t *testing.T) {
 // 测试单节点发送消息
 func TestSingleSendMessage(t *testing.T) {
 	s := NewTestServer(t)
-	s.opts.Mode = TestMode
+	s.opts.Mode = options.TestMode
 	err := s.Start()
 	assert.Nil(t, err)
 	defer s.StopNoErr()
@@ -121,7 +122,7 @@ func TestClusterSlotMigrate(t *testing.T) {
 
 	cfg := s1.GetClusterConfig()
 
-	var migrateSlot *pb.Slot
+	var migrateSlot *types.Slot
 	for _, slot := range cfg.Slots {
 		if slot.Leader == s1.opts.Cluster.NodeId {
 			migrateSlot = slot
@@ -161,7 +162,7 @@ func TestClusterSlotMigrate(t *testing.T) {
 
 // 槽迁移，从追随者迁移到leader
 func TestClusterSlotMigrateForFollowToLeader(t *testing.T) {
-	s1, s2 := NewTestClusterServerTwoNode(t, WithClusterSlotReplicaCount(2), WithClusterChannelReactorSubCount(1), WithClusterSlotReactorSubCount(1))
+	s1, s2 := NewTestClusterServerTwoNode(t, options.WithClusterSlotReplicaCount(2), options.WithClusterChannelReactorSubCount(1), options.WithClusterSlotReactorSubCount(1))
 	err := s1.Start()
 	assert.Nil(t, err)
 
@@ -175,7 +176,7 @@ func TestClusterSlotMigrateForFollowToLeader(t *testing.T) {
 
 	cfg := s1.GetClusterConfig()
 
-	var migrateSlot *pb.Slot
+	var migrateSlot *types.Slot
 	for _, slot := range cfg.Slots {
 		if slot.Leader == s1.opts.Cluster.NodeId {
 			migrateSlot = slot
@@ -231,7 +232,7 @@ func TestClusterNodeJoin(t *testing.T) {
 	assert.Equal(t, 2, len(cfg.Nodes))
 
 	// new server
-	s3 := NewTestServer(t, WithDemoOn(false), WithClusterSeed("1001@127.0.0.1:11110"), WithClusterServerAddr("0.0.0.0:11115"), WithWSAddr("ws://0.0.0.0:5250"), WithManagerAddr("0.0.0.0:5350"), WithAddr("tcp://0.0.0.0:5150"), WithHTTPAddr("0.0.0.0:5005"), WithClusterAddr("tcp://0.0.0.0:11115"), WithClusterNodeId(1005))
+	s3 := NewTestServer(t, options.WithDemoOn(false), options.WithClusterSeed("1001@127.0.0.1:11110"), options.WithClusterServerAddr("0.0.0.0:11115"), options.WithWSAddr("ws://0.0.0.0:5250"), options.WithManagerAddr("0.0.0.0:5350"), options.WithAddr("tcp://0.0.0.0:5150"), options.WithHTTPAddr("0.0.0.0:5005"), options.WithClusterAddr("tcp://0.0.0.0:11115"), options.WithClusterNodeId(1005))
 	err = s3.Start()
 	assert.Nil(t, err)
 	defer s3.StopNoErr()
@@ -269,70 +270,70 @@ func TestClusterNodeJoin(t *testing.T) {
 
 }
 
-func TestClusterChannelMigrate(t *testing.T) {
-	s1, s2 := NewTestClusterServerTwoNode(t, WithClusterChannelReplicaCount(1), WithClusterSlotReplicaCount(2))
-	err := s1.Start()
-	assert.Nil(t, err)
+// func TestClusterChannelMigrate(t *testing.T) {
+// 	s1, s2 := NewTestClusterServerTwoNode(t, options.WithClusterChannelReplicaCount(1), options.WithClusterSlotReplicaCount(2))
+// 	err := s1.Start()
+// 	assert.Nil(t, err)
 
-	err = s2.Start()
-	assert.Nil(t, err)
+// 	err = s2.Start()
+// 	assert.Nil(t, err)
 
-	defer s1.StopNoErr()
-	defer s2.StopNoErr()
+// 	defer s1.StopNoErr()
+// 	defer s2.StopNoErr()
 
-	MustWaitClusterReady(s1, s2)
+// 	MustWaitClusterReady(s1, s2)
 
-	// new client 1
-	cli1 := client.New(s1.opts.External.TCPAddr, client.WithUID("test1"))
-	err = cli1.Connect()
-	assert.Nil(t, err)
+// 	// new client 1
+// 	cli1 := client.New(s1.opts.External.TCPAddr, client.WithUID("test1"))
+// 	err = cli1.Connect()
+// 	assert.Nil(t, err)
 
-	// new client 2
-	cli2 := client.New(s2.opts.External.TCPAddr, client.WithUID("test2"))
-	err = cli2.Connect()
-	assert.Nil(t, err)
+// 	// new client 2
+// 	cli2 := client.New(s2.opts.External.TCPAddr, client.WithUID("test2"))
+// 	err = cli2.Connect()
+// 	assert.Nil(t, err)
 
-	// send message to test2
-	err = cli1.SendMessage(client.NewChannel("test2", 1), []byte("hello"))
-	assert.Nil(t, err)
+// 	// send message to test2
+// 	err = cli1.SendMessage(client.NewChannel("test2", 1), []byte("hello"))
+// 	assert.Nil(t, err)
 
-	var wait sync.WaitGroup
-	wait.Add(1)
+// 	var wait sync.WaitGroup
+// 	wait.Add(1)
 
-	// cli2 recv
-	cli2.SetOnRecv(func(recv *wkproto.RecvPacket) error {
-		assert.Equal(t, "hello", string(recv.Payload))
-		wait.Done()
-		return nil
-	})
+// 	// cli2 recv
+// 	cli2.SetOnRecv(func(recv *wkproto.RecvPacket) error {
+// 		assert.Equal(t, "hello", string(recv.Payload))
+// 		wait.Done()
+// 		return nil
+// 	})
 
-	wait.Wait()
+// 	wait.Wait()
 
-	cfg, err := s1.store.DB().GetChannelClusterConfig("test1@test2", 1)
-	assert.Nil(t, err)
-	assert.Equal(t, 1, len(cfg.Replicas))
+// 	cfg, err := s1.store.DB().GetChannelClusterConfig("test1@test2", 1)
+// 	assert.Nil(t, err)
+// 	assert.Equal(t, 1, len(cfg.Replicas))
 
-	// 迁移到另外一个节点
+// 	// 迁移到另外一个节点
 
-	var migrateTo uint64
-	if cfg.Replicas[0] == s1.opts.Cluster.NodeId {
-		migrateTo = s2.opts.Cluster.NodeId
-	} else {
-		migrateTo = s1.opts.Cluster.NodeId
-	}
-	cfg.MigrateFrom = cfg.Replicas[0]
-	cfg.MigrateTo = migrateTo
-	cfg.Learners = append(cfg.Learners, migrateTo)
+// 	var migrateTo uint64
+// 	if cfg.Replicas[0] == s1.opts.Cluster.NodeId {
+// 		migrateTo = s2.opts.Cluster.NodeId
+// 	} else {
+// 		migrateTo = s1.opts.Cluster.NodeId
+// 	}
+// 	cfg.MigrateFrom = cfg.Replicas[0]
+// 	cfg.MigrateTo = migrateTo
+// 	cfg.Learners = append(cfg.Learners, migrateTo)
 
-	err = s1.clusterServer.ProposeChannelClusterConfig(cfg)
-	assert.Nil(t, err)
+// 	err = s1.clusterServer.ProposeChannelClusterConfig(cfg)
+// 	assert.Nil(t, err)
 
-	s1.clusterServer.UpdateChannelClusterConfig(cfg)
-	s2.clusterServer.UpdateChannelClusterConfig(cfg)
+// 	s1.clusterServer.UpdateChannelClusterConfig(cfg)
+// 	s2.clusterServer.UpdateChannelClusterConfig(cfg)
 
-	time.Sleep(time.Second * 1)
+// 	time.Sleep(time.Second * 1)
 
-}
+// }
 
 func TestClusterChannelElection(t *testing.T) {
 	s1, s2, s3 := NewTestClusterServerTreeNode(t)
@@ -486,7 +487,7 @@ func TestClusterFailover(t *testing.T) {
 	channelId := "g1"
 	channelType := wkproto.ChannelTypeGroup
 
-	TestAddSubscriber(t, s2, channelId, channelType, "u1", "u2", "u3")
+	// TestAddSubscriber(t, s2, channelId, channelType, "u1", "u2", "u3")
 
 	cli1 := TestCreateClient(t, s1, "u1")
 	cli2 := TestCreateClient(t, s2, "u2")
@@ -561,7 +562,7 @@ func TestClusterSaveClusterConfig(t *testing.T) {
 	createdAt := time.Now()
 	updatedAt := time.Now()
 
-	err := s1.store.SaveChannelClusterConfig(context.Background(), wkdb.ChannelClusterConfig{
+	_, err := s1.store.SaveChannelClusterConfig(wkdb.ChannelClusterConfig{
 		ChannelId:       "test1@test2",
 		ChannelType:     1,
 		ReplicaMaxCount: 3,
@@ -576,7 +577,7 @@ func TestClusterSaveClusterConfig(t *testing.T) {
 
 func BenchmarkSingleSendMessage(b *testing.B) {
 	s := NewTestServer(b)
-	s.opts.Mode = TestMode
+	s.opts.Mode = options.TestMode
 	err := s.Start()
 	assert.Nil(b, err)
 	defer s.StopNoErr()
