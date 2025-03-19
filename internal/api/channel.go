@@ -982,7 +982,9 @@ func (ch *channel) syncMessages(c *wkhttp.Context) {
 	} else if req.PullMode == PullModeUp { // 向上拉取
 		messages, err = service.Store.LoadNextRangeMsgs(fakeChannelID, req.ChannelType, req.StartMessageSeq, req.EndMessageSeq, limit)
 	} else {
-		messages, err = service.Store.LoadPrevRangeMsgs(fakeChannelID, req.ChannelType, req.StartMessageSeq, req.EndMessageSeq, limit)
+		if req.EndMessageSeq <= req.StartMessageSeq {
+			messages, err = service.Store.LoadPrevRangeMsgs(fakeChannelID, req.ChannelType, req.StartMessageSeq, req.EndMessageSeq, limit)
+		}
 	}
 	if err != nil {
 		ch.Error("获取消息失败！", zap.Error(err), zap.Any("req", req))
@@ -1029,8 +1031,6 @@ func (ch *channel) syncMessages(c *wkhttp.Context) {
 		streamNos = append(streamNos, message.StreamNo)
 	}
 
-	fmt.Println("streamNos---->", streamNos)
-
 	if len(streamNos) > 0 {
 		streamItemsMap, err := ch.loadStreamMessages(fakeChannelID, req.ChannelType, streamNos)
 		if err != nil {
@@ -1039,7 +1039,6 @@ func (ch *channel) syncMessages(c *wkhttp.Context) {
 			return
 		}
 
-		fmt.Println("streamItemsMap--->", streamItemsMap)
 		for _, message := range messageResps {
 			if strings.TrimSpace(message.StreamNo) == "" {
 				continue

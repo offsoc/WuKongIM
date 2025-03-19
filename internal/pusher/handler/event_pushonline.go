@@ -2,7 +2,6 @@ package handler
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/eventbus"
@@ -44,11 +43,8 @@ func (h *Handler) processChannelPush(events []*eventbus.Event) {
 
 		sendPacket := e.Frame.(*wkproto.SendPacket)
 
-		fakeChannelId := sendPacket.ChannelID
-		channelType := sendPacket.ChannelType
-		if channelType == wkproto.ChannelTypePerson {
-			fakeChannelId = options.GetFakeChannelIDWith(e.Conn.Uid, e.ToUid)
-		}
+		fakeChannelId := e.ChannelId
+		channelType := e.ChannelType
 
 		fromUid := e.Conn.Uid
 		// 如果发送者是系统账号，则不显示发送者
@@ -179,11 +175,9 @@ func (h *Handler) processAIPush(uid string, e *eventbus.Event) {
 	}
 	pluginObj := service.PluginManager.Plugin(pluginNo)
 	if pluginObj == nil {
-		h.Error("AI插件不存在！", zap.String("pluginNo", pluginNo), zap.String("uid", uid))
+		h.Debug("AI插件不存在！", zap.String("pluginNo", pluginNo), zap.String("uid", uid))
 		return
 	}
-
-	fmt.Println("plugin--->", uid, pluginNo, pluginObj)
 
 	sendPacket := e.Frame.(*wkproto.SendPacket)
 
