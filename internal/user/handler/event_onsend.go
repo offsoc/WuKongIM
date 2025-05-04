@@ -47,21 +47,40 @@ func (h *Handler) handleOnSend(event *eventbus.Event) {
 		fakeChannelId = options.GetFakeChannelIDWith(channelId, conn.Uid)
 	}
 
-	// 解密消息
-	newPayload, err := h.decryptPayload(sendPacket, conn)
-	if err != nil {
-		h.Error("handleOnSend: Failed to decrypt payload！", zap.Error(err), zap.String("uid", conn.Uid), zap.String("channelId", channelId), zap.Uint8("channelType", channelType))
-		sendack := &wkproto.SendackPacket{
-			Framer:      sendPacket.Framer,
-			MessageID:   event.MessageId,
-			ClientSeq:   sendPacket.ClientSeq,
-			ClientMsgNo: sendPacket.ClientMsgNo,
-			ReasonCode:  wkproto.ReasonPayloadDecodeError,
-		}
-		eventbus.User.ConnWrite(conn, sendack)
-		return
+	if options.G.Logger.TraceOn {
+		h.Trace("用户发送消息...",
+			"onSend",
+			zap.Int64("messageId", event.MessageId),
+			zap.Uint64("messageSeq", event.MessageSeq),
+			zap.String("from", event.Conn.Uid),
+			zap.String("deviceId", event.Conn.DeviceId),
+			zap.String("deviceFlag", event.Conn.DeviceFlag.String()),
+			zap.Int64("connId", event.Conn.ConnId),
+			zap.String("channelId", fakeChannelId),
+			zap.Uint8("channelType", channelType),
+		)
 	}
-	sendPacket.Payload = newPayload
+
+	// 根据配置决定是否解密消息
+	if !options.G.DisableEncryption && !conn.IsJsonRpc {
+		newPayload, err := h.decryptPayload(sendPacket, conn)
+		if err != nil {
+			h.Error("handleOnSend: Failed to decrypt payload！", zap.Error(err), zap.String("uid", conn.Uid), zap.String("channelId", channelId), zap.Uint8("channelType", channelType))
+			sendack := &wkproto.SendackPacket{
+				Framer:      sendPacket.Framer,
+				MessageID:   event.MessageId,
+				ClientSeq:   sendPacket.ClientSeq,
+				ClientMsgNo: sendPacket.ClientMsgNo,
+				ReasonCode:  wkproto.ReasonPayloadDecodeError,
+			}
+			eventbus.User.ConnWrite(event.ReqId, conn, sendack)
+			return
+		}
+		sendPacket.Payload = newPayload // 使用解密后的 Payload
+	} else {
+		// 如果禁用了加密，则直接使用原始 Payload，不做任何操作
+		// sendPacket.Payload 保持不变
+	}
 
 	// 调用插件
 	h.pluginInvokeSend(sendPacket, event)
@@ -75,6 +94,7 @@ func (h *Handler) handleOnSend(event *eventbus.Event) {
 		Frame:     sendPacket,
 		MessageId: event.MessageId,
 		Track:     event.Track,
+		ReqId:     event.ReqId,
 	})
 	// 推进
 	eventbus.Channel.Advance(fakeChannelId, channelType)

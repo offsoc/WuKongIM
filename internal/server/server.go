@@ -154,8 +154,8 @@ func New(opts *options.Options) *Server {
 	s.webhook = webhook.New()
 	service.Webhook = s.webhook
 	// manager
-	s.retryManager = manager.NewRetryManager()               // 消息重试管理
-	s.conversationManager = manager.NewConversationManager() // 会话管理
+	s.retryManager = manager.NewRetryManager()                 // 消息重试管理
+	s.conversationManager = manager.NewConversationManager(10) // 会话管理
 	s.tagManager = manager.NewTagManager(16, func() uint64 {
 		return service.Cluster.NodeVersion()
 	})
@@ -225,7 +225,11 @@ func New(opts *options.Options) *Server {
 
 	// plugin server
 	s.pluginServer = plugin.NewServer(
-		plugin.NewOptions(plugin.WithDir(path.Join(s.opts.RootDir, "plugins"))),
+		plugin.NewOptions(
+			plugin.WithDir(path.Join(s.opts.RootDir, "plugins")),
+			plugin.WithSocketPath(s.opts.Plugin.SocketPath),
+			plugin.WithInstall(s.opts.Plugin.Install),
+		),
 	)
 	service.PluginManager = s.pluginServer
 	return s

@@ -53,19 +53,20 @@ const (
 )
 
 type Options struct {
-	vp          *viper.Viper // 内部配置对象
-	Mode        Mode         // 模式 debug 测试 release 正式 bench 压力测试
-	HTTPAddr    string       // http api的监听地址 默认为 0.0.0.0:5001
-	Addr        string       // tcp监听地址 例如：tcp://0.0.0.0:5100
-	RootDir     string       // 根目录
-	DataDir     string       // 数据目录
-	GinMode     string       // gin框架的模式
-	WSAddr      string       // websocket 监听地址 例如：ws://0.0.0.0:5200
-	WSSAddr     string       // wss 监听地址 例如：wss://0.0.0.0:5210
-	WSTLSConfig *tls.Config
-	Stress      bool     // 是否开启压力测试
-	Violent     bool     // 狂暴模式，开启这个后将以性能为第一，稳定性第二, 压力测试模式下默认为true
-	WSSConfig   struct { // wss的证书配置
+	vp                *viper.Viper // 内部配置对象
+	Mode              Mode         // 模式 debug 测试 release 正式 bench 压力测试
+	HTTPAddr          string       // http api的监听地址 默认为 0.0.0.0:5001
+	Addr              string       // tcp监听地址 例如：tcp://0.0.0.0:5100
+	RootDir           string       // 根目录
+	DataDir           string       // 数据目录
+	GinMode           string       // gin框架的模式
+	WSAddr            string       // websocket 监听地址 例如：ws://0.0.0.0:5200
+	WSSAddr           string       // wss 监听地址 例如：wss://0.0.0.0:5210
+	WSTLSConfig       *tls.Config
+	Stress            bool     // 是否开启压力测试
+	Violent           bool     // 狂暴模式，开启这个后将以性能为第一，稳定性第二, 压力测试模式下默认为true
+	DisableEncryption bool     // 禁用加密
+	WSSConfig         struct { // wss的证书配置
 		CertFile string // 证书文件
 		KeyFile  string // 私钥文件
 	}
@@ -303,8 +304,11 @@ type Options struct {
 	}
 	// 插件配置
 	Plugin struct {
-		Timeout time.Duration // 插件超时时间
+		Timeout    time.Duration // 插件超时时间
+		SocketPath string        // 插件socket地址
+		Install    []string      // 默认插件安装地址
 	}
+	DisableJSONRPC bool // 是否禁用jsonrpc
 }
 
 type MigrateStep string
@@ -413,7 +417,7 @@ func New(op ...Option) *Options {
 			On:                 true,
 			CacheExpire:        time.Hour * 2,
 			UserMaxCount:       1000,
-			SyncInterval:       time.Minute * 5,
+			SyncInterval:       time.Minute,
 			SyncOnce:           100,
 			BytesPerSave:       1024 * 1024 * 5,
 			SavePoolSize:       100,
@@ -665,7 +669,9 @@ func New(op ...Option) *Options {
 			Expire: time.Minute * 20,
 		},
 		Plugin: struct {
-			Timeout time.Duration
+			Timeout    time.Duration
+			SocketPath string
+			Install    []string
 		}{
 			Timeout: time.Second * 1,
 		},
@@ -695,6 +701,11 @@ func (o *Options) ConfigureWithViper(vp *viper.Viper) {
 	o.vp = vp
 	// o.ID = o.getInt64("id", o.ID)
 
+	homeDir, err := GetHomeDir()
+	if err != nil {
+		panic(err)
+	}
+
 	o.RootDir = o.getString("rootDir", o.RootDir)
 
 	modeStr := o.getString("mode", string(o.Mode))
@@ -721,6 +732,8 @@ func (o *Options) ConfigureWithViper(vp *viper.Viper) {
 	if strings.TrimSpace(o.ManagerToken) != "" {
 		o.ManagerTokenOn = true
 	}
+
+	o.DisableEncryption = o.getBool("disableEncryption", o.DisableEncryption)
 
 	o.External.IP = o.getString("external.ip", o.External.IP)
 	o.External.TCPAddr = o.getString("external.tcpAddr", o.External.TCPAddr)
@@ -817,7 +830,6 @@ func (o *Options) ConfigureWithViper(vp *viper.Viper) {
 	o.configureLog(vp)   // 日志配置
 
 	externalIp := o.External.IP
-	var err error
 	if strings.TrimSpace(externalIp) == "" && o.External.AutoGetExternalIP { // 开启了自动获取外网ip并且没有配置外网ip
 		externalIp, err = GetExternalIP() // 获取外网IP
 		if err != nil {
@@ -970,6 +982,14 @@ func (o *Options) ConfigureWithViper(vp *viper.Viper) {
 
 	// =================== plugin ===================
 	o.Plugin.Timeout = o.getDuration("plugin.timeout", o.Plugin.Timeout)
+	o.Plugin.SocketPath = o.getString("plugin.socketPath", o.Plugin.SocketPath)
+	if strings.TrimSpace(o.Plugin.SocketPath) == "" {
+		o.Plugin.SocketPath = path.Join(homeDir, ".wukong", "run", "wukongim.sock")
+	}
+	installPlugins := o.getStringSlice("plugin.install")
+	if len(installPlugins) > 0 {
+		o.Plugin.Install = installPlugins
+	}
 
 	// =================== other ===================
 	deadlock.Opts.Disable = !o.DeadlockCheck
@@ -977,6 +997,7 @@ func (o *Options) ConfigureWithViper(vp *viper.Viper) {
 	o.PprofOn = o.getBool("pprofOn", o.PprofOn)
 	o.OldV1Api = o.getString("oldV1Api", o.OldV1Api)
 	o.MigrateStartStep = MigrateStep(o.getString("migrateStartStep", string(o.MigrateStartStep)))
+	o.DisableJSONRPC = o.getBool("disableJSONRPC", o.DisableJSONRPC)
 
 }
 
@@ -1118,6 +1139,9 @@ func (o *Options) configureAuth() {
 	})
 
 	o.Auth.Users = usersCfgs
+	if len(usersCfgs) > 0 {
+		o.Auth.On = true
+	}
 
 	node, err := snowflake.NewNode(int64(o.Cluster.NodeId))
 	if err != nil {

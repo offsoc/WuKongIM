@@ -32,6 +32,12 @@ func (n *Node) Step(e types.Event) error {
 				n.BecomeFollower(e.Term, None)
 			}
 		}
+	case e.Term == n.cfg.Term:
+		if e.Type == types.VoteReq {
+			n.Info("received vote request with same term, reject vote", zap.Uint32("term", e.Term), zap.Uint64("from", e.From))
+			n.sendVoteResp(e.From, types.ReasonError)
+			return nil
+		}
 	}
 
 	switch e.Type {
@@ -415,7 +421,13 @@ func (n *Node) quorum() int {
 // 是否可以投票
 func (n *Node) canVote(e types.Event) bool {
 
-	if n.cfg.Term > e.Term { // 如果当前任期大于候选人任期，拒绝投票
+	// 检查候选人日志信息是否存在
+	if len(e.Logs) == 0 {
+		n.Info("candidate log info missing, reject vote")
+		return false
+	}
+
+	if n.cfg.Term > e.Term { // 如果当前任期大于候选人任期，拒绝投票 (不能等于，因为前面becomeFollower的时候，会更新任期 TODO:这里逻辑有点问题，因为n.cfg.Term 永远等于e.Term)
 		n.Info("current term is greater than candidate term", zap.Uint32("term", n.cfg.Term), zap.Uint32("candidateTerm", e.Term))
 		return false
 	}
